@@ -1,0 +1,16 @@
+{
+  "name": "node-scraper",
+  "version": "1.0.0",
+  "description": "Node server for opening MobileSentrix in Chrome.",
+  "main": "serverms.js",
+  "scripts": {
+    "start": "node serverms.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "express": "^4.19.2",
+    "selenium-webdriver": "^4.23.0"
+  }
+}
