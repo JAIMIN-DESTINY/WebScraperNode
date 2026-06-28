@@ -29,6 +29,10 @@ function createChromeDriver() {
     '--no-sandbox',
     '--disable-dev-shm-usage',
     '--disable-gpu',
+    '--disable-extensions',
+    '--disable-background-networking',
+    '--disable-renderer-backgrounding',
+    '--disable-background-timer-throttling',
     '--window-size=1920,1080',
     `--user-agent=${DESKTOP_USER_AGENT}`
   );
@@ -107,24 +111,16 @@ function extractImgFromAttr(value) {
   return value.split(',')[0].trim().split(' ')[0].trim();
 }
 
-async function getProductDetails(productUrl, previousDriver = null) {
+async function getProductDetails(driver, productUrl) {
   if (!productUrl) {
     return {
       sku: '',
       description: '',
-      driver: previousDriver,
     };
   }
 
-  const driver = await createChromeDriver();
-
   try {
     await driver.get(productUrl);
-
-    if (previousDriver) {
-      await previousDriver.quit().catch(() => {});
-    }
-
     await driver.wait(until.elementLocated(By.css('body')), 30000);
     await driver.sleep(1000);
 
@@ -194,11 +190,8 @@ async function getProductDetails(productUrl, previousDriver = null) {
 
     return {
       ...details,
-      driver,
     };
   } catch (error) {
-    await driver.quit().catch(() => {});
-
     throw error;
   }
 }
@@ -296,8 +289,7 @@ async function openChromeAndGetCategories() {
 }
 
 async function openChromeAndGetProducts(url) {
-  const driver = await createChromeDriver();
-  let currentDriver = driver;
+  let driver = await createChromeDriver();
   const products = [];
 
   try {
@@ -363,19 +355,29 @@ async function openChromeAndGetProducts(url) {
     }
 
     for (const product of products) {
-      const details = await getProductDetails(product.product_url, currentDriver);
-      currentDriver = details.driver || currentDriver;
-      product.sku = normalizeText(details.sku);
-      product.description = (details.description || '').trim();
+      try {
+        const details = await getProductDetails(driver, product.product_url);
+        product.sku = normalizeText(details.sku);
+        product.description = (details.description || '').trim();
+      } catch (error) {
+        const message = error.message || '';
+
+        if (!message.includes('invalid session id') && !message.includes('disconnected')) {
+          throw error;
+        }
+
+        await driver.quit().catch(() => {});
+        driver = await createChromeDriver();
+
+        const details = await getProductDetails(driver, product.product_url);
+        product.sku = normalizeText(details.sku);
+        product.description = (details.description || '').trim();
+      }
     }
 
     return products;
   } finally {
-    await currentDriver.quit().catch(() => {});
-
-    if (currentDriver !== driver) {
-      await driver.quit().catch(() => {});
-    }
+    await driver.quit().catch(() => {});
   }
 }
 
