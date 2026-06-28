@@ -12,7 +12,7 @@ function normalizeText(value) {
 
 function createChromeDriver() {
   const options = new chrome.Options();
-  options.addArguments('--no-sandbox', '--disable-dev-shm-usage', '--window-size=1920,1080');
+  options.addArguments('--headless=new', '--no-sandbox', '--disable-dev-shm-usage', '--window-size=1920,1080');
 
   if (process.env.CHROME_PATH) {
     options.setChromeBinaryPath(process.env.CHROME_PATH);
