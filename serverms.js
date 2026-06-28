@@ -2,7 +2,7 @@ const express = require('express');
 const { Builder, By, until } = require('selenium-webdriver');
 const chrome = require('selenium-webdriver/chrome');
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 3001;
 const TARGET_URL = 'https://www.mobilesentrix.com/';
 const app = express();
 
