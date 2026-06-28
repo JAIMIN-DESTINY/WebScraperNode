@@ -5,6 +5,18 @@ const chrome = require('selenium-webdriver/chrome');
 const PORT = process.env.PORT || 3001;
 const TARGET_URL = 'https://www.mobilesentrix.com/';
 const app = express();
+const DESKTOP_USER_AGENT =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+const CATEGORY_MENU_LINK_SELECTORS = [
+  '.mob-desk-menu > li > a',
+  '.mob-desk-menu a[href]',
+  '.nav-primary > li > a',
+  '.nav-primary a[href]',
+  '.navigation .level0 > a',
+  '.navigation a[href]',
+  '#nav > li > a',
+  '#nav a[href]',
+];
 
 function normalizeText(value) {
   return (value || '').replace(/\s+/g, ' ').trim();
@@ -12,13 +24,55 @@ function normalizeText(value) {
 
 function createChromeDriver() {
   const options = new chrome.Options();
-  options.addArguments('--headless=new', '--no-sandbox', '--disable-dev-shm-usage', '--window-size=1920,1080');
+  options.addArguments(
+    '--headless=new',
+    '--no-sandbox',
+    '--disable-dev-shm-usage',
+    '--disable-gpu',
+    '--window-size=1920,1080',
+    `--user-agent=${DESKTOP_USER_AGENT}`
+  );
 
   if (process.env.CHROME_PATH) {
     options.setChromeBinaryPath(process.env.CHROME_PATH);
   }
 
   return new Builder().forBrowser('chrome').setChromeOptions(options).build();
+}
+
+async function waitForCategoryMenu(driver, timeoutMs = 60000) {
+  await driver.wait(until.elementLocated(By.css('body')), 30000);
+  await driver.wait(
+    async () => driver.executeScript('return document.readyState;').then((state) => state === 'complete'),
+    30000
+  );
+
+  const startedAt = Date.now();
+
+  while (Date.now() - startedAt < timeoutMs) {
+    for (const selector of CATEGORY_MENU_LINK_SELECTORS) {
+      const count = await driver.executeScript(
+        'return document.querySelectorAll(arguments[0]).length;',
+        selector
+      );
+
+      if (count > 0) {
+        return selector;
+      }
+    }
+
+    await driver.sleep(1000);
+  }
+
+  const debugInfo = await driver.executeScript(() => ({
+    title: document.title,
+    url: window.location.href,
+    bodyText: (document.body?.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 500),
+  }));
+
+  throw new Error(
+    `Category menu was not found. title="${debugInfo.title}" url="${debugInfo.url}" body="${debugInfo.bodyText}"`
+  );
 }
 
 async function autoScrollUntilStable(driver, maxRounds = 25, waitMs = 1200) {
@@ -154,15 +208,16 @@ async function openChromeAndGetCategories() {
 
   try {
     await driver.get(TARGET_URL);
-    await driver.wait(until.elementLocated(By.css('.mob-desk-menu')), 30000);
+    const mainCategorySelector = await waitForCategoryMenu(driver);
 
     const mainCategoryCount = await driver.executeScript(
-      'return document.querySelectorAll(".mob-desk-menu > li > a").length;'
+      'return document.querySelectorAll(arguments[0]).length;',
+      mainCategorySelector
     );
     const categoryGroups = [];
 
     for (let index = 0; index < mainCategoryCount; index++) {
-      const mainCategoryLinks = await driver.findElements(By.css('.mob-desk-menu > li > a'));
+      const mainCategoryLinks = await driver.findElements(By.css(mainCategorySelector));
       const mainCategoryLink = mainCategoryLinks[index];
 
       if (!mainCategoryLink) {
