@@ -111,91 +111,6 @@ function extractImgFromAttr(value) {
   return value.split(',')[0].trim().split(' ')[0].trim();
 }
 
-async function getProductDetails(driver, productUrl) {
-  if (!productUrl) {
-    return {
-      sku: '',
-      description: '',
-    };
-  }
-
-  try {
-    await driver.get(productUrl);
-    await driver.wait(until.elementLocated(By.css('body')), 30000);
-    await driver.sleep(1000);
-
-    const details = await driver.executeScript(() => {
-      const normalize = (value) => (value || '').replace(/\s+/g, ' ').trim();
-      const getValueBySelectors = (selectors) => {
-        for (const selector of selectors) {
-          const element = document.querySelector(selector);
-          const text = normalize(element?.textContent);
-          const content = normalize(element?.getAttribute('content'));
-          const value = normalize(element?.getAttribute('value'));
-          const resolvedValue = text || content || value;
-
-          if (resolvedValue) {
-            return resolvedValue;
-          }
-        }
-
-        return '';
-      };
-
-      const getHtmlBySelectors = (selectors) => {
-        for (const selector of selectors) {
-          const element = document.querySelector(selector);
-          const html = element?.innerHTML?.trim();
-
-          if (html) {
-            return html;
-          }
-        }
-
-        return '';
-      };
-
-      const sku = getValueBySelectors([
-        '[itemprop="sku"]',
-        '.product-info-stock-sku .value',
-        '.product.attribute.sku .value',
-        '.sku .value',
-        '.sku',
-      ]).replace(/^SKU\s*[:#-]?\s*/i, '');
-
-      let description = getHtmlBySelectors([
-        '#product_tabs_description_tabbed_contents',
-        '#description',
-        '#product_tabs_description_contents',
-        '.product.attribute.description .value',
-        '.product-collateral .description',
-        '.short-description',
-        '.product-description',
-        '[itemprop="description"]',
-      ]);
-
-      if (!description) {
-        const title = Array.from(document.querySelectorAll('h2, h3, h4, .data.item.title, .title'))
-          .find((element) => normalize(element.textContent).toLowerCase().includes('description'));
-
-        const content = title?.nextElementSibling;
-        description = content?.innerHTML?.trim() || '';
-      }
-
-      return {
-        sku,
-        description,
-      };
-    });
-
-    return {
-      ...details,
-    };
-  } catch (error) {
-    throw error;
-  }
-}
-
 async function openChromeAndGetCategories() {
   const driver = await createChromeDriver();
 
@@ -348,30 +263,7 @@ async function openChromeAndGetProducts(url) {
           price: normalizeText(price),
           img,
           product_url: productUrl,
-          sku: '',
-          description: '',
         });
-      }
-    }
-
-    for (const product of products) {
-      try {
-        const details = await getProductDetails(driver, product.product_url);
-        product.sku = normalizeText(details.sku);
-        product.description = (details.description || '').trim();
-      } catch (error) {
-        const message = error.message || '';
-
-        if (!message.includes('invalid session id') && !message.includes('disconnected')) {
-          throw error;
-        }
-
-        await driver.quit().catch(() => {});
-        driver = await createChromeDriver();
-
-        const details = await getProductDetails(driver, product.product_url);
-        product.sku = normalizeText(details.sku);
-        product.description = (details.description || '').trim();
       }
     }
 
@@ -403,7 +295,7 @@ async function openTargetUrl(request, response) {
 
 async function getProduct(request, response) {
   const { url } = request.query;
-
+  console.log(`Open http://localhost:${PORT}/getProduct?url=${url}`);
   if (!url) {
     return response.status(400).json({
       success: false,
