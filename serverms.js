@@ -34,7 +34,7 @@ const CATEGORY_MENU_LINK_SELECTORS = [
 ];
 const DESKTOP_USER_AGENT =
   process.env.CHROME_USER_AGENT ||
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36';
 
 const config = {
   workers: readPositiveInt('PLAYWRIGHT_WORKERS', 50),
@@ -45,6 +45,8 @@ const config = {
   redisUrl: (process.env.REDIS_URL || '').trim(),
   browserPoolSize: readPositiveInt('BROWSER_POOL_SIZE', 1),
   maxProductPages: readPositiveInt('MAX_PRODUCT_PAGES', 1),
+  cloudflareRetries: readPositiveInt('CLOUDFLARE_RETRIES', 3),
+  cloudflareWaitMs: readPositiveInt('CLOUDFLARE_WAIT_MS', 5000),
   locale: process.env.PLAYWRIGHT_LOCALE || 'en-US',
   timezoneId: process.env.PLAYWRIGHT_TIMEZONE || 'America/New_York',
 };
@@ -104,17 +106,7 @@ function createLaunchOptions() {
     args: [
       '--no-sandbox',
       '--disable-dev-shm-usage',
-      '--disable-gpu',
-      '--disable-extensions',
-      '--disable-sync',
-      '--disable-background-networking',
-      '--disable-renderer-backgrounding',
-      '--disable-background-timer-throttling',
-      '--disable-client-side-phishing-detection',
-      '--disable-component-update',
-      '--disable-default-apps',
-      '--disable-features=Translate,BackForwardCache,AcceptCHFrame,MediaRouter',
-      '--disable-popup-blocking',
+      '--disable-blink-features=AutomationControlled',
       '--no-first-run',
       '--no-default-browser-check',
       '--window-size=1920,1080',
@@ -132,6 +124,10 @@ async function createOptimizedContext(browser) {
   const context = await browser.newContext({
     userAgent: DESKTOP_USER_AGENT,
     viewport: { width: 1920, height: 1080 },
+    screen: { width: 1920, height: 1080 },
+    deviceScaleFactor: 1,
+    isMobile: false,
+    hasTouch: false,
     locale: config.locale,
     timezoneId: config.timezoneId,
     javaScriptEnabled: true,
@@ -152,6 +148,9 @@ async function createOptimizedContext(browser) {
 async function configureContext(context) {
   await context.addInitScript(() => {
     Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+    Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
+    Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
   });
 
   await context.route('**/*', async (route) => {
@@ -309,6 +308,51 @@ async function gotoPage(page, url, waitUntil = 'domcontentloaded') {
   await page.waitForLoadState('domcontentloaded', { timeout: config.requestTimeout }).catch(() => {});
 }
 
+async function getPageDebugInfo(page) {
+  return page.evaluate(() => ({
+    title: document.title,
+    url: window.location.href,
+    bodyText: (document.body?.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 500),
+  }));
+}
+
+function isCloudflareChallenge(debugInfo) {
+  const text = `${debugInfo.title || ''} ${debugInfo.bodyText || ''}`.toLowerCase();
+
+  return (
+    text.includes('just a moment') ||
+    text.includes('performing security verification') ||
+    text.includes('verifies you are not a bot') ||
+    text.includes('performance and security by cloudflare')
+  );
+}
+
+async function gotoPageWithCloudflareRetry(page, url) {
+  let lastDebugInfo = null;
+
+  for (let attempt = 1; attempt <= config.cloudflareRetries; attempt++) {
+    await gotoPage(page, url);
+    await page.waitForSelector('body', { state: 'attached', timeout: config.requestTimeout }).catch(() => {});
+    await page.waitForLoadState('networkidle', { timeout: config.cloudflareWaitMs }).catch(() => {});
+
+    lastDebugInfo = await getPageDebugInfo(page);
+
+    if (!isCloudflareChallenge(lastDebugInfo)) {
+      return;
+    }
+
+    console.error(
+      `Cloudflare verification page detected for ${url}; retrying ${attempt}/${config.cloudflareRetries}.`
+    );
+    await page.waitForTimeout(config.cloudflareWaitMs * attempt);
+    await page.reload({ waitUntil: 'domcontentloaded', timeout: config.requestTimeout }).catch(() => {});
+  }
+
+  throw new Error(
+    `Cloudflare verification did not clear. title="${lastDebugInfo?.title || ''}" url="${lastDebugInfo?.url || url}" body="${lastDebugInfo?.bodyText || ''}"`
+  );
+}
+
 async function waitForCategoryMenu(page, timeoutMs = 60000) {
   await page.waitForSelector('body', { state: 'attached', timeout: config.requestTimeout });
 
@@ -326,11 +370,7 @@ async function waitForCategoryMenu(page, timeoutMs = 60000) {
     await page.waitForTimeout(250);
   }
 
-  const debugInfo = await page.evaluate(() => ({
-    title: document.title,
-    url: window.location.href,
-    bodyText: (document.body?.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 500),
-  }));
+  const debugInfo = await getPageDebugInfo(page);
 
   throw new Error(
     `Category menu was not found. title="${debugInfo.title}" url="${debugInfo.url}" body="${debugInfo.bodyText}"`
@@ -691,7 +731,7 @@ async function openPlaywrightAndGetCategories() {
   try {
     await pagePool.start();
     page = await pagePool.acquire();
-    await gotoPage(page, TARGET_URL);
+    await gotoPageWithCloudflareRetry(page, TARGET_URL);
     const mainCategorySelector = await waitForCategoryMenu(page);
     const mainCategoryCount = await page.locator(mainCategorySelector).count();
     const categoryGroups = [];
