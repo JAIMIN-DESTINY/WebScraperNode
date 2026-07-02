@@ -1,12 +1,12 @@
 const express = require('express');
-const { randomUUID } = require('crypto');
 const { chromium } = require('playwright');
-const { Queue, Worker, QueueEvents } = require('bullmq');
-const IORedis = require('ioredis');
+const path = require('path');
 
 const PORT = readPositiveInt('PORT', 3001);
 const TARGET_URL = 'https://www.mobilesentrix.com/';
-const PRODUCT_ITEM_SELECTOR = 'li.item';
+const ALLOWED_HOSTS = new Set(['mobilesentrix.com', 'www.mobilesentrix.com']);
+
+const PRODUCT_ITEM_SELECTOR = 'li.item, .products-grid .item, .product-item';
 const PRODUCT_DETAIL_READY_SELECTORS = [
   '[itemprop="sku"]',
   '.product-info-stock-sku .value',
@@ -21,37 +21,47 @@ const PRODUCT_DETAIL_READY_SELECTORS = [
   '.short-description',
   '.product-description',
   '[itemprop="description"]',
+  'script[type="application/ld+json"]',
 ];
 const CATEGORY_MENU_LINK_SELECTORS = [
   '.mob-desk-menu > li > a',
-  '.mob-desk-menu a[href]',
   '.nav-primary > li > a',
-  '.nav-primary a[href]',
   '.navigation .level0 > a',
-  '.navigation a[href]',
   '#nav > li > a',
+  '.mob-desk-menu a[href]',
+  '.nav-primary a[href]',
+  '.navigation a[href]',
   '#nav a[href]',
 ];
+
 const DESKTOP_USER_AGENT =
   process.env.CHROME_USER_AGENT ||
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36';
 
 const config = {
-  workers: readPositiveInt('PLAYWRIGHT_WORKERS', 50),
-  maxConcurrentPages: readPositiveInt('MAX_CONCURRENT_PAGES', readPositiveInt('PLAYWRIGHT_WORKERS', 50)),
-  requestTimeout: readPositiveInt('REQUEST_TIMEOUT', 60000),
-  retryCount: Math.max(0, readInteger('RETRY_COUNT', 2)),
+  maxConcurrentPages: readPositiveInt('MAX_CONCURRENT_PAGES', 6),
+  detailConcurrency: readPositiveInt('DETAIL_CONCURRENCY', readPositiveInt('MAX_CONCURRENT_PAGES', 6)),
+  requestTimeout: readPositiveInt('REQUEST_TIMEOUT', 45000),
+  productDetailTimeout: readPositiveInt('PRODUCT_DETAIL_TIMEOUT', 15000),
+  retryCount: Math.max(0, readInteger('RETRY_COUNT', 1)),
   headless: readBoolean('HEADLESS', true),
-  redisUrl: (process.env.REDIS_URL || '').trim(),
-  browserPoolSize: readPositiveInt('BROWSER_POOL_SIZE', 1),
   maxProductPages: readPositiveInt('MAX_PRODUCT_PAGES', 1),
+  scrapeDetails: readBoolean('SCRAPE_DETAILS', true),
+  blockImages: readBoolean('BLOCK_IMAGES', true),
+  blockStylesheets: readBoolean('BLOCK_STYLESHEETS', false),
   cloudflareRetries: readPositiveInt('CLOUDFLARE_RETRIES', 3),
-  cloudflareWaitMs: readPositiveInt('CLOUDFLARE_WAIT_MS', 5000),
+  cloudflareWaitMs: readPositiveInt('CLOUDFLARE_WAIT_MS', 3000),
   locale: process.env.PLAYWRIGHT_LOCALE || 'en-US',
   timezoneId: process.env.PLAYWRIGHT_TIMEZONE || 'America/New_York',
+  userDataDir: process.env.PLAYWRIGHT_USER_DATA_DIR || path.join(__dirname, '.ms-playwright-profile'),
+  detailCacheTtlMs: readPositiveInt('DETAIL_CACHE_TTL_MINUTES', 720) * 60 * 1000,
+  maxCacheItems: readPositiveInt('DETAIL_CACHE_MAX_ITEMS', 10000),
 };
 
 const app = express();
+const detailCache = new Map();
+let pagePool = null;
+let pagePoolStartPromise = null;
 
 function readInteger(name, defaultValue) {
   const value = Number.parseInt(process.env[name] || `${defaultValue}`, 10);
@@ -68,6 +78,14 @@ function readBoolean(name, defaultValue) {
   }
 
   return ['1', 'true', 'yes', 'on'].includes(`${process.env[name]}`.toLowerCase());
+}
+
+function readQueryBoolean(value, defaultValue) {
+  if (value === undefined || value === null || value === '') {
+    return defaultValue;
+  }
+
+  return ['1', 'true', 'yes', 'on'].includes(`${value}`.toLowerCase());
 }
 
 function normalizeText(value) {
@@ -100,13 +118,54 @@ function isoSeconds(date) {
   return date.toISOString().slice(0, 19);
 }
 
+function getLimitedPositiveInt(value, defaultValue, maxValue) {
+  const parsed = Number.parseInt(value || `${defaultValue}`, 10);
+  if (!Number.isFinite(parsed) || parsed < 1) {
+    return defaultValue;
+  }
+
+  return Math.min(parsed, maxValue);
+}
+
+function validateTargetUrl(input) {
+  let parsedUrl;
+
+  try {
+    parsedUrl = new URL(input);
+  } catch (error) {
+    throw new Error('Invalid URL parameter.');
+  }
+
+  if (!['http:', 'https:'].includes(parsedUrl.protocol)) {
+    throw new Error('Only HTTP/HTTPS URLs are allowed.');
+  }
+
+  if (!ALLOWED_HOSTS.has(parsedUrl.hostname)) {
+    throw new Error('Only MobileSentrix category/product URLs are allowed.');
+  }
+
+  return parsedUrl.toString();
+}
+
 function createLaunchOptions() {
   const launchOptions = {
     headless: config.headless,
+    userAgent: DESKTOP_USER_AGENT,
+    viewport: { width: 1920, height: 1080 },
+    screen: { width: 1920, height: 1080 },
+    deviceScaleFactor: 1,
+    isMobile: false,
+    hasTouch: false,
+    locale: config.locale,
+    timezoneId: config.timezoneId,
+    javaScriptEnabled: true,
+    bypassCSP: false,
+    extraHTTPHeaders: {
+      'Accept-Language': `${config.locale},en;q=0.9`,
+    },
     args: [
       '--no-sandbox',
       '--disable-dev-shm-usage',
-      '--disable-blink-features=AutomationControlled',
       '--no-first-run',
       '--no-default-browser-check',
       '--window-size=1920,1080',
@@ -120,43 +179,18 @@ function createLaunchOptions() {
   return launchOptions;
 }
 
-async function createOptimizedContext(browser) {
-  const context = await browser.newContext({
-    userAgent: DESKTOP_USER_AGENT,
-    viewport: { width: 1920, height: 1080 },
-    screen: { width: 1920, height: 1080 },
-    deviceScaleFactor: 1,
-    isMobile: false,
-    hasTouch: false,
-    locale: config.locale,
-    timezoneId: config.timezoneId,
-    javaScriptEnabled: true,
-    bypassCSP: false,
-    extraHTTPHeaders: {
-      'Accept-Language': `${config.locale},en;q=0.9`,
-      'Cache-Control': 'no-cache',
-    },
-  });
-
+async function configureContext(context) {
   context.setDefaultTimeout(config.requestTimeout);
   context.setDefaultNavigationTimeout(config.requestTimeout);
-  await configureContext(context);
-
-  return context;
-}
-
-async function configureContext(context) {
-  await context.addInitScript(() => {
-    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-    Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-    Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
-    Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-  });
 
   await context.route('**/*', async (route) => {
     const resourceType = route.request().resourceType();
 
-    if (['font', 'media'].includes(resourceType)) {
+    if (config.blockImages && ['image', 'font', 'media'].includes(resourceType)) {
+      return route.abort();
+    }
+
+    if (config.blockStylesheets && resourceType === 'stylesheet') {
       return route.abort();
     }
 
@@ -164,43 +198,41 @@ async function configureContext(context) {
   });
 }
 
-class BrowserPagePool {
+class PersistentPagePool {
   constructor(pageCount) {
     this.pageCount = pageCount;
-    this.browsers = [];
-    this.contexts = [];
+    this.context = null;
     this.availablePages = [];
+    this.createdPages = 0;
     this.waiters = [];
+    this.closed = false;
   }
 
   async start() {
-    const browserCount = Math.min(config.browserPoolSize, this.pageCount);
-    const pagesPerBrowser = Math.ceil(this.pageCount / browserCount);
-
-    for (let browserIndex = 0; browserIndex < browserCount; browserIndex++) {
-      const browser = await chromium.launch(createLaunchOptions());
-      const context = await createOptimizedContext(browser);
-
-      this.browsers.push(browser);
-      this.contexts.push(context);
-
-      const remainingPages = this.pageCount - this.availablePages.length;
-      const pagesToCreate = Math.min(pagesPerBrowser, remainingPages);
-
-      for (let pageIndex = 0; pageIndex < pagesToCreate; pageIndex++) {
-        const page = await context.newPage();
-        page.setDefaultTimeout(config.requestTimeout);
-        page.setDefaultNavigationTimeout(config.requestTimeout);
-        this.availablePages.push(page);
-      }
+    if (this.context) {
+      return;
     }
+
+    this.context = await chromium.launchPersistentContext(config.userDataDir, createLaunchOptions());
+    await configureContext(this.context);
   }
 
   async acquire() {
-    const page = this.availablePages.pop();
+    if (this.closed) {
+      throw new Error('Page pool is already closed.');
+    }
 
-    if (page) {
+    const page = this.availablePages.pop();
+    if (page && !page.isClosed()) {
       return page;
+    }
+
+    if (this.createdPages < this.pageCount) {
+      this.createdPages++;
+      const newPage = await this.context.newPage();
+      newPage.setDefaultTimeout(config.requestTimeout);
+      newPage.setDefaultNavigationTimeout(config.requestTimeout);
+      return newPage;
     }
 
     return new Promise((resolve) => {
@@ -208,9 +240,16 @@ class BrowserPagePool {
     });
   }
 
-  release(page) {
-    const waiter = this.waiters.shift();
+  async release(page) {
+    if (!page || page.isClosed()) {
+      this.createdPages = Math.max(0, this.createdPages - 1);
+      this.releaseWaiter(null);
+      return;
+    }
 
+    await page.goto('about:blank', { waitUntil: 'domcontentloaded', timeout: 5000 }).catch(() => {});
+
+    const waiter = this.waiters.shift();
     if (waiter) {
       waiter(page);
       return;
@@ -219,85 +258,35 @@ class BrowserPagePool {
     this.availablePages.push(page);
   }
 
+  releaseWaiter(page) {
+    const waiter = this.waiters.shift();
+    if (waiter && page) {
+      waiter(page);
+    }
+  }
+
   async close() {
-    await Promise.all(
-      this.contexts.map((context) => context.close().catch((error) => {
-        console.error(`Playwright context close failed: ${error.message}`);
-      }))
-    );
-    await Promise.all(
-      this.browsers.map((browser) => browser.close().catch((error) => {
-        console.error(`Playwright browser close failed: ${error.message}`);
-      }))
-    );
+    this.closed = true;
+    await this.context?.close().catch((error) => {
+      console.error(`Playwright context close failed: ${error.message}`);
+    });
   }
 }
 
-class IsolatedPagePool {
-  constructor(pageCount) {
-    this.pageCount = pageCount;
-    this.browsers = [];
-    this.activePages = 0;
-    this.waiters = [];
-    this.nextBrowserIndex = 0;
+async function getPagePool() {
+  if (pagePool && pagePool.context && !pagePool.closed) {
+    return pagePool;
   }
 
-  async start() {
-    const browserCount = Math.min(config.browserPoolSize, this.pageCount);
-
-    for (let index = 0; index < browserCount; index++) {
-      this.browsers.push(await chromium.launch(createLaunchOptions()));
-    }
-  }
-
-  async acquire() {
-    if (this.activePages >= this.pageCount) {
-      await new Promise((resolve) => {
-        this.waiters.push(resolve);
-      });
-    }
-
-    this.activePages++;
-
-    try {
-      const browser = this.browsers[this.nextBrowserIndex % this.browsers.length];
-      this.nextBrowserIndex++;
-      const context = await createOptimizedContext(browser);
-      const page = await context.newPage();
-      page.setDefaultTimeout(config.requestTimeout);
-      page.setDefaultNavigationTimeout(config.requestTimeout);
-      return page;
-    } catch (error) {
-      this.activePages--;
-      this.releaseWaiter();
-      throw error;
-    }
-  }
-
-  async release(page) {
-    await page.context().close().catch((error) => {
-      console.error(`Playwright isolated context close failed: ${error.message}`);
+  if (!pagePoolStartPromise) {
+    pagePool = new PersistentPagePool(config.maxConcurrentPages);
+    pagePoolStartPromise = pagePool.start().finally(() => {
+      pagePoolStartPromise = null;
     });
-
-    this.activePages--;
-    this.releaseWaiter();
   }
 
-  releaseWaiter() {
-    const waiter = this.waiters.shift();
-
-    if (waiter) {
-      waiter();
-    }
-  }
-
-  async close() {
-    await Promise.all(
-      this.browsers.map((browser) => browser.close().catch((error) => {
-        console.error(`Playwright browser close failed: ${error.message}`);
-      }))
-    );
-  }
+  await pagePoolStartPromise;
+  return pagePool;
 }
 
 async function gotoPage(page, url, waitUntil = 'domcontentloaded') {
@@ -305,7 +294,7 @@ async function gotoPage(page, url, waitUntil = 'domcontentloaded') {
     waitUntil,
     timeout: config.requestTimeout,
   });
-  await page.waitForLoadState('domcontentloaded', { timeout: config.requestTimeout }).catch(() => {});
+  await page.waitForSelector('body', { state: 'attached', timeout: config.requestTimeout }).catch(() => {});
 }
 
 async function getPageDebugInfo(page) {
@@ -323,44 +312,42 @@ function isCloudflareChallenge(debugInfo) {
     text.includes('just a moment') ||
     text.includes('performing security verification') ||
     text.includes('verifies you are not a bot') ||
-    text.includes('performance and security by cloudflare')
+    text.includes('performance and security by cloudflare') ||
+    text.includes('checking your browser')
   );
 }
 
-async function gotoPageWithCloudflareRetry(page, url) {
+async function gotoPageWithCloudflareCheck(page, url) {
   let lastDebugInfo = null;
 
   for (let attempt = 1; attempt <= config.cloudflareRetries; attempt++) {
     await gotoPage(page, url);
-    await page.waitForSelector('body', { state: 'attached', timeout: config.requestTimeout }).catch(() => {});
-    await page.waitForLoadState('networkidle', { timeout: config.cloudflareWaitMs }).catch(() => {});
+    await page.waitForTimeout(attempt === 1 ? 500 : config.cloudflareWaitMs);
 
     lastDebugInfo = await getPageDebugInfo(page);
-
     if (!isCloudflareChallenge(lastDebugInfo)) {
       return;
     }
 
-    console.error(
-      `Cloudflare verification page detected for ${url}; retrying ${attempt}/${config.cloudflareRetries}.`
-    );
+    console.error(`Cloudflare verification page detected for ${url}. Attempt ${attempt}/${config.cloudflareRetries}.`);
     await page.waitForTimeout(config.cloudflareWaitMs * attempt);
-    await page.reload({ waitUntil: 'domcontentloaded', timeout: config.requestTimeout }).catch(() => {});
   }
 
+  const hint = config.headless
+    ? 'Run once with HEADLESS=false and complete the verification manually. The persistent profile will reuse that valid session after that.'
+    : 'Complete the verification in the opened browser window, then retry the request.';
+
   throw new Error(
-    `Cloudflare verification did not clear. title="${lastDebugInfo?.title || ''}" url="${lastDebugInfo?.url || url}" body="${lastDebugInfo?.bodyText || ''}"`
+    `Cloudflare verification did not clear. ${hint} title="${lastDebugInfo?.title || ''}" url="${lastDebugInfo?.url || url}"`
   );
 }
 
-async function waitForCategoryMenu(page, timeoutMs = 60000) {
-  await page.waitForSelector('body', { state: 'attached', timeout: config.requestTimeout });
-
+async function waitForCategoryMenu(page, timeoutMs = 30000) {
   const startedAt = Date.now();
 
   while (Date.now() - startedAt < timeoutMs) {
     for (const selector of CATEGORY_MENU_LINK_SELECTORS) {
-      const count = await page.locator(selector).count();
+      const count = await page.locator(selector).count().catch(() => 0);
 
       if (count > 0) {
         return selector;
@@ -377,9 +364,9 @@ async function waitForCategoryMenu(page, timeoutMs = 60000) {
   );
 }
 
-async function autoScrollUntilStable(page, maxRounds = 25) {
-  let previousCount = 0;
-  let previousHeight = 0;
+async function autoScrollUntilStable(page, maxRounds = 12) {
+  let previousCount = -1;
+  let previousHeight = -1;
   let stableRounds = 0;
 
   for (let round = 0; round < maxRounds; round++) {
@@ -392,12 +379,12 @@ async function autoScrollUntilStable(page, maxRounds = 25) {
       };
     }, PRODUCT_ITEM_SELECTOR);
 
-    await page.waitForLoadState('networkidle', { timeout: 1500 }).catch(() => {});
+    await page.waitForTimeout(350);
 
     if (count === previousCount && height === previousHeight) {
       stableRounds++;
 
-      if (stableRounds >= 3) {
+      if (stableRounds >= 2) {
         break;
       }
     } else {
@@ -419,16 +406,41 @@ async function extractProductsFromCurrentPage(page) {
       return value.split(',')[0].trim().split(' ')[0].trim();
     };
 
+    const getFirstText = (root, selectors) => {
+      for (const itemSelector of selectors) {
+        const text = normalize(root.querySelector(itemSelector)?.textContent || '');
+        if (text) {
+          return text;
+        }
+      }
+
+      return '';
+    };
+
+    const getFirstHref = (root, selectors) => {
+      for (const itemSelector of selectors) {
+        const href = root.querySelector(itemSelector)?.href || '';
+        if (href) {
+          return href;
+        }
+      }
+
+      return '';
+    };
+
     return Array.from(document.querySelectorAll(selector))
       .map((item) => {
-        const name = normalize(item.querySelector('h2.product-name')?.textContent || '');
-        const price = normalize(
-          item.querySelector('span.regular-price')?.textContent ||
-            item.querySelector('.price')?.textContent ||
-            ''
-        );
-        const imgElement = item.querySelector('img.small-img');
-        const attributes = ['src', 'data-src', 'srcset', 'data-lazy', 'data-original'];
+        const name = getFirstText(item, [
+          'h2.product-name',
+          '.product-name',
+          '.product-item-name',
+          '.product-item-link',
+          'a.product-image.figure',
+          'a.product-image',
+        ]);
+        const price = getFirstText(item, ['span.regular-price', '.regular-price', '.price-box .price', '.price']);
+        const imgElement = item.querySelector('img.small-img, img.product-image-photo, img');
+        const attributes = ['src', 'data-src', 'srcset', 'data-srcset', 'data-lazy', 'data-original'];
         let img = '';
 
         if (imgElement) {
@@ -445,7 +457,15 @@ async function extractProductsFromCurrentPage(page) {
           }
         }
 
-        const productUrl = item.querySelector('a.product-image.figure')?.href || '';
+        const productUrl = getFirstHref(item, [
+          'a.product-image.figure',
+          'a.product-image',
+          'h2.product-name a',
+          '.product-name a',
+          '.product-item-name a',
+          '.product-item-link',
+          'a[href]',
+        ]);
 
         if (!name && !price && !img && !productUrl) {
           return null;
@@ -464,18 +484,21 @@ async function extractProductsFromCurrentPage(page) {
   }, PRODUCT_ITEM_SELECTOR);
 }
 
-async function scrapeProductListing(url, pagePool) {
-  const page = await pagePool.acquire();
+async function scrapeProductListing(url, pool, maxPages) {
+  const page = await pool.acquire();
   const products = [];
   const seenProducts = new Set();
 
   try {
-    for (let pageNumber = 1; pageNumber <= config.maxProductPages; pageNumber++) {
+    for (let pageNumber = 1; pageNumber <= maxPages; pageNumber++) {
       const pageUrl = buildProductPageUrl(url, pageNumber);
-      await gotoPage(page, pageUrl);
+      await gotoPageWithCloudflareCheck(page, pageUrl);
 
       try {
-        await page.waitForSelector(PRODUCT_ITEM_SELECTOR, { state: 'attached', timeout: config.requestTimeout });
+        await page.waitForSelector(PRODUCT_ITEM_SELECTOR, {
+          state: 'attached',
+          timeout: Math.min(config.requestTimeout, 20000),
+        });
       } catch (error) {
         if (pageNumber === 1) {
           throw error;
@@ -497,15 +520,48 @@ async function scrapeProductListing(url, pagePool) {
         products.push(product);
       }
 
-      if (config.maxProductPages <= 1) {
+      if (maxPages <= 1) {
         break;
       }
     }
 
     return products;
   } finally {
-    await pagePool.release(page);
+    await pool.release(page);
   }
+}
+
+function getProductDetailFromCache(productUrl) {
+  const cached = detailCache.get(productUrl);
+
+  if (!cached) {
+    return null;
+  }
+
+  if (Date.now() - cached.createdAt > config.detailCacheTtlMs) {
+    detailCache.delete(productUrl);
+    return null;
+  }
+
+  return cached.data;
+}
+
+function setProductDetailCache(productUrl, data) {
+  if (!productUrl) {
+    return;
+  }
+
+  if (detailCache.size >= config.maxCacheItems) {
+    const oldestKey = detailCache.keys().next().value;
+    if (oldestKey) {
+      detailCache.delete(oldestKey);
+    }
+  }
+
+  detailCache.set(productUrl, {
+    createdAt: Date.now(),
+    data,
+  });
 }
 
 async function scrapeProductDetails(page, productUrl) {
@@ -513,22 +569,25 @@ async function scrapeProductDetails(page, productUrl) {
     return { sku: '', description: '' };
   }
 
-  await gotoPage(page, productUrl);
-  await page.waitForSelector('body', { state: 'attached', timeout: config.requestTimeout });
+  await gotoPageWithCloudflareCheck(page, productUrl);
+
   await page
     .waitForFunction(
       (selectors) =>
         selectors.some((selector) => {
           const element = document.querySelector(selector);
-          return (element?.textContent || element?.innerHTML || '').replace(/\s+/g, ' ').trim();
+          return (element?.textContent || element?.innerHTML || element?.getAttribute('content') || '')
+            .replace(/\s+/g, ' ')
+            .trim();
         }),
       PRODUCT_DETAIL_READY_SELECTORS,
-      { timeout: Math.min(config.requestTimeout, 10000) }
+      { timeout: config.productDetailTimeout }
     )
     .catch(() => {});
 
   return page.evaluate(() => {
     const normalize = (value) => (value || '').replace(/\s+/g, ' ').trim();
+
     const getValueBySelectors = (selectors) => {
       for (const selector of selectors) {
         const element = document.querySelector(selector);
@@ -558,13 +617,40 @@ async function scrapeProductDetails(page, productUrl) {
       return '';
     };
 
-    const sku = getValueBySelectors([
-      '[itemprop="sku"]',
-      '.product-info-stock-sku .value',
-      '.product.attribute.sku .value',
-      '.sku .value',
-      '.sku',
-    ]).replace(/^SKU\s*[:#-]?\s*/i, '');
+    const getStructuredProduct = () => {
+      const scripts = Array.from(document.querySelectorAll('script[type="application/ld+json"]'));
+
+      for (const script of scripts) {
+        try {
+          const parsed = JSON.parse(script.textContent || '');
+          const nodes = Array.isArray(parsed) ? parsed : [parsed, ...(Array.isArray(parsed?.['@graph']) ? parsed['@graph'] : [])];
+          const product = nodes.find((node) => `${node?.['@type'] || ''}`.toLowerCase() === 'product');
+
+          if (product) {
+            return {
+              sku: normalize(product.sku || product.mpn || ''),
+              description: normalize(product.description || ''),
+            };
+          }
+        } catch (error) {
+          // Ignore broken JSON-LD and use DOM selectors below.
+        }
+      }
+
+      return { sku: '', description: '' };
+    };
+
+    const structuredProduct = getStructuredProduct();
+    const sku = (
+      structuredProduct.sku ||
+      getValueBySelectors([
+        '[itemprop="sku"]',
+        '.product-info-stock-sku .value',
+        '.product.attribute.sku .value',
+        '.sku .value',
+        '.sku',
+      ])
+    ).replace(/^SKU\s*[:#-]?\s*/i, '');
 
     let description = getHtmlBySelectors([
       '#product_tabs_description_tabbed_contents',
@@ -577,6 +663,14 @@ async function scrapeProductDetails(page, productUrl) {
       '[itemprop="description"]',
     ]);
 
+    if (!description && structuredProduct.description) {
+      description = structuredProduct.description;
+    }
+
+    if (!description) {
+      description = getValueBySelectors(['meta[name="description"]', 'meta[property="og:description"]']);
+    }
+
     if (!description) {
       const title = Array.from(document.querySelectorAll('h2, h3, h4, .data.item.title, .title'))
         .find((element) => normalize(element.textContent).toLowerCase().includes('description'));
@@ -586,42 +680,66 @@ async function scrapeProductDetails(page, productUrl) {
     }
 
     return {
-      sku,
-      description,
+      sku: normalize(sku),
+      description: description || '',
     };
   });
 }
 
-async function hydrateSingleProduct(product, pagePool) {
-  const page = await pagePool.acquire();
+async function hydrateSingleProduct(product, pool) {
+  const cached = getProductDetailFromCache(product.product_url);
+  if (cached) {
+    product.sku = cached.sku;
+    product.description = cached.description;
+    return;
+  }
+
+  const page = await pool.acquire();
 
   try {
     const details = await scrapeProductDetails(page, product.product_url);
-    product.sku = normalizeText(details.sku);
-    product.description = (details.description || '').trim();
+    const normalizedDetails = {
+      sku: normalizeText(details.sku),
+      description: (details.description || '').trim(),
+    };
+
+    setProductDetailCache(product.product_url, normalizedDetails);
+    product.sku = normalizedDetails.sku;
+    product.description = normalizedDetails.description;
   } finally {
-    await pagePool.release(page);
+    await pool.release(page);
   }
 }
 
-async function runInMemoryQueue(products, pagePool) {
+async function hydrateProductDetails(products, pool) {
+  const uniqueProductsByUrl = new Map();
+
+  for (const product of products) {
+    if (product.product_url && !uniqueProductsByUrl.has(product.product_url)) {
+      uniqueProductsByUrl.set(product.product_url, product);
+    }
+  }
+
+  const uniqueProducts = Array.from(uniqueProductsByUrl.values());
   let nextIndex = 0;
-  const workerCount = Math.min(config.workers, config.maxConcurrentPages, products.length || 1);
+  const workerCount = Math.min(config.detailConcurrency, config.maxConcurrentPages, uniqueProducts.length || 1);
 
   async function runWorker() {
-    while (nextIndex < products.length) {
+    while (nextIndex < uniqueProducts.length) {
       const index = nextIndex++;
-      const product = products[index];
+      const product = uniqueProducts[index];
 
       for (let attempt = 0; attempt <= config.retryCount; attempt++) {
         try {
-          await hydrateSingleProduct(product, pagePool);
+          await hydrateSingleProduct(product, pool);
           break;
         } catch (error) {
           if (attempt >= config.retryCount) {
             product.sku = '';
             product.description = '';
             console.error(`Product detail fetch failed for ${product.product_url}: ${error.message}`);
+          } else {
+            await new Promise((resolve) => setTimeout(resolve, 500 * (attempt + 1)));
           }
         }
       }
@@ -629,158 +747,48 @@ async function runInMemoryQueue(products, pagePool) {
   }
 
   await Promise.all(Array.from({ length: workerCount }, () => runWorker()));
-}
 
-async function createRedisConnection() {
-  if (!config.redisUrl) {
-    return null;
-  }
-
-  const connection = new IORedis(config.redisUrl, {
-    maxRetriesPerRequest: null,
-    enableReadyCheck: false,
-  });
-
-  try {
-    await Promise.race([
-      connection.ping(),
-      new Promise((_, reject) => setTimeout(() => reject(new Error('Redis connection timeout')), 3000)),
-    ]);
-    return connection;
-  } catch (error) {
-    console.error(`Redis is unavailable; using in-memory queue: ${error.message}`);
-    connection.disconnect();
-    return null;
-  }
-}
-
-async function runBullQueue(products, pagePool, connection) {
-  const queueName = `mobilesentrix-products-${randomUUID()}`;
-  const queue = new Queue(queueName, { connection });
-  const queueEvents = new QueueEvents(queueName, { connection });
-  const worker = new Worker(
-    queueName,
-    async (job) => {
-      const { index } = job.data;
-      const product = products[index];
-      await hydrateSingleProduct(product, pagePool);
-      return { index };
-    },
-    {
-      connection,
-      concurrency: Math.min(config.workers, config.maxConcurrentPages),
+  for (const product of products) {
+    if (!product.product_url) {
+      continue;
     }
-  );
 
-  try {
-    await queueEvents.waitUntilReady();
-    const jobs = await queue.addBulk(
-      products.map((product, index) => ({
-        name: 'scrape-product',
-        data: { index, product_url: product.product_url },
-        opts: {
-          jobId: `product-${index}`,
-          attempts: config.retryCount + 1,
-          backoff: { type: 'exponential', delay: 500 },
-          removeOnComplete: true,
-          removeOnFail: true,
-        },
-      }))
-    );
-
-    await Promise.all(
-      jobs.map((job) =>
-        job.waitUntilFinished(queueEvents).catch((error) => {
-          const product = products[job.data.index];
-          product.sku = '';
-          product.description = '';
-          console.error(`Product detail fetch failed for ${product.product_url}: ${error.message}`);
-        })
-      )
-    );
-  } finally {
-    await worker.close().catch(() => {});
-    await queueEvents.close().catch(() => {});
-    await queue.close().catch(() => {});
+    const details = getProductDetailFromCache(product.product_url);
+    if (details) {
+      product.sku = details.sku;
+      product.description = details.description;
+    }
   }
 }
 
-async function hydrateProductDetails(products, pagePool) {
-  if (!products.length) {
-    return;
-  }
+async function extractCategoryGroups(page, mainCategorySelector) {
+  return page.evaluate((selector) => {
+    const normalize = (value) => (value || '').replace(/\s+/g, ' ').trim();
+    const topLinks = Array.from(document.querySelectorAll(selector));
 
-  const redisConnection = await createRedisConnection();
-
-  if (!redisConnection) {
-    await runInMemoryQueue(products, pagePool);
-    return;
-  }
-
-  try {
-    await runBullQueue(products, pagePool, redisConnection);
-  } finally {
-    await redisConnection.quit().catch(() => redisConnection.disconnect());
-  }
-}
-
-async function openPlaywrightAndGetCategories() {
-  const pagePool = new BrowserPagePool(1);
-  let page = null;
-
-  try {
-    await pagePool.start();
-    page = await pagePool.acquire();
-    await gotoPageWithCloudflareRetry(page, TARGET_URL);
-    const mainCategorySelector = await waitForCategoryMenu(page);
-    const mainCategoryCount = await page.locator(mainCategorySelector).count();
-    const categoryGroups = [];
-
-    for (let index = 0; index < mainCategoryCount; index++) {
-      const mainCategoryLink = page.locator(mainCategorySelector).nth(index);
-      const mainCategoryName = normalizeText(await mainCategoryLink.textContent());
-
-      await mainCategoryLink.scrollIntoViewIfNeeded();
-      await mainCategoryLink.hover().catch(() => {});
-      await mainCategoryLink.click({ timeout: 5000 }).catch(async () => {
-        await mainCategoryLink.evaluate((link) => link.click());
-      });
-
-      await page
-        .waitForFunction(
-          ({ selector, linkIndex }) => {
-            const link = document.querySelectorAll(selector)[linkIndex];
-            const mainCategory = link?.closest('li');
-            return (mainCategory?.querySelectorAll('a[href]').length || 0) > 1;
-          },
-          { selector: mainCategorySelector, linkIndex: index },
-          { timeout: 5000 }
-        )
-        .catch(() => {});
-
-      const categories = await mainCategoryLink.evaluate((link) => {
-        const mainCategory = link.closest('li');
-
-        if (!mainCategory) {
-          return [];
-        }
-
+    return topLinks
+      .map((link) => {
+        const mainCategoryName = normalize(
+          link.textContent ||
+            link.getAttribute('aria-label') ||
+            link.querySelector('img')?.getAttribute('alt') ||
+            link.querySelector('img')?.getAttribute('title') ||
+            ''
+        );
+        const mainCategory = link.closest('li') || link.parentElement;
         const seen = new Set();
-
-        return Array.from(mainCategory.querySelectorAll('a[href]'))
+        const categories = Array.from(mainCategory?.querySelectorAll('a[href]') || [])
           .map((categoryLink) => {
             const rawUrl = (categoryLink.getAttribute('href') || '').trim();
-            const url = categoryLink.href;
             const image = categoryLink.querySelector('img');
-            const name = (
+            const name = normalize(
               categoryLink.textContent ||
-              categoryLink.getAttribute('aria-label') ||
-              image?.getAttribute('alt') ||
-              image?.getAttribute('title') ||
-              ''
-            )
-              .replace(/\s+/g, ' ')
-              .trim();
+                categoryLink.getAttribute('aria-label') ||
+                image?.getAttribute('alt') ||
+                image?.getAttribute('title') ||
+                ''
+            );
+            const url = categoryLink.href;
 
             if (!name || !rawUrl || rawUrl === '#' || rawUrl.startsWith('javascript:')) {
               return null;
@@ -795,36 +803,59 @@ async function openPlaywrightAndGetCategories() {
             return { name, url };
           })
           .filter(Boolean);
-      });
 
-      categoryGroups.push({
-        mainCategory: mainCategoryName,
-        count: categories.length,
-        categories,
-      });
+        if (!mainCategoryName && !categories.length) {
+          return null;
+        }
+
+        return {
+          mainCategory: mainCategoryName,
+          count: categories.length,
+          categories,
+        };
+      })
+      .filter(Boolean);
+  }, mainCategorySelector);
+}
+
+async function openPlaywrightAndGetCategories() {
+  const pool = await getPagePool();
+  const page = await pool.acquire();
+
+  try {
+    await gotoPageWithCloudflareCheck(page, TARGET_URL);
+    const mainCategorySelector = await waitForCategoryMenu(page);
+    let categoryGroups = await extractCategoryGroups(page, mainCategorySelector);
+
+    // Some themes load submenu links only after hover. Use hover only as a fallback.
+    const needsHoverFallback = categoryGroups.some((group) => group.count <= 1);
+    if (needsHoverFallback) {
+      const count = await page.locator(mainCategorySelector).count();
+      for (let index = 0; index < count; index++) {
+        await page.locator(mainCategorySelector).nth(index).hover().catch(() => {});
+        await page.waitForTimeout(150);
+      }
+
+      categoryGroups = await extractCategoryGroups(page, mainCategorySelector);
     }
 
     return categoryGroups;
   } finally {
-    if (page) {
-      await pagePool.release(page);
-    }
-    await pagePool.close();
+    await pool.release(page);
   }
 }
 
-async function openPlaywrightAndGetProducts(url) {
-  const pageCount = Math.min(config.maxConcurrentPages, Math.max(1, config.workers));
-  const pagePool = new IsolatedPagePool(pageCount);
+async function openPlaywrightAndGetProducts(url, options = {}) {
+  const pool = await getPagePool();
+  const maxPages = options.maxPages || config.maxProductPages;
+  const includeDetails = options.includeDetails ?? config.scrapeDetails;
+  const products = await scrapeProductListing(url, pool, maxPages);
 
-  try {
-    await pagePool.start();
-    const products = await scrapeProductListing(url, pagePool);
-    await hydrateProductDetails(products, pagePool);
-    return products;
-  } finally {
-    await pagePool.close();
+  if (includeDetails) {
+    await hydrateProductDetails(products, pool);
   }
+
+  return products;
 }
 
 async function openTargetUrl(request, response) {
@@ -848,27 +879,43 @@ async function openTargetUrl(request, response) {
 }
 
 async function getProduct(request, response) {
-  const { url } = request.query;
   const processStartedAt = new Date();
   const processStartedMs = Date.now();
+  const rawUrl = request.query.url;
 
-  console.log(`Open http://localhost:${PORT}/getProduct?url=${url}`);
+  console.log(`Open http://localhost:${PORT}/getProduct?url=${rawUrl || ''}`);
 
-  if (!url) {
+  if (!rawUrl) {
     return response.status(400).json({
       success: false,
       message: 'URL parameter is required.',
     });
   }
 
+  let url;
   try {
-    const products = await openPlaywrightAndGetProducts(url);
+    url = validateTargetUrl(rawUrl);
+  } catch (error) {
+    return response.status(400).json({
+      success: false,
+      message: error.message,
+    });
+  }
+
+  const maxPages = getLimitedPositiveInt(request.query.pages, config.maxProductPages, 25);
+  const includeDetails = readQueryBoolean(request.query.details, config.scrapeDetails);
+
+  try {
+    const products = await openPlaywrightAndGetProducts(url, { maxPages, includeDetails });
     const processFinishedAt = new Date();
 
     return response.json({
       success: true,
       url,
       count: products.length,
+      include_details: includeDetails,
+      max_pages: maxPages,
+      cache_items: detailCache.size,
       process_start_date: isoSeconds(processStartedAt),
       process_end_date: isoSeconds(processFinishedAt),
       sync_minutes: Number(((Date.now() - processStartedMs) / 60000).toFixed(2)),
@@ -881,6 +928,8 @@ async function getProduct(request, response) {
       success: false,
       url,
       error: error.message,
+      include_details: includeDetails,
+      max_pages: maxPages,
       process_start_date: isoSeconds(processStartedAt),
       process_end_date: isoSeconds(processFinishedAt),
       sync_minutes: Number(((Date.now() - processStartedMs) / 60000).toFixed(2)),
@@ -891,28 +940,49 @@ async function getProduct(request, response) {
 app.get('/', (request, response) => {
   response.json({
     status: 'running',
-    openUrl: `http://localhost:${PORT}/getCategory`,
+    getCategory: `http://localhost:${PORT}/getCategory`,
+    getProduct: `http://localhost:${PORT}/getProduct?url=<category-url>&details=1&pages=1`,
+    config: {
+      maxConcurrentPages: config.maxConcurrentPages,
+      detailConcurrency: config.detailConcurrency,
+      maxProductPages: config.maxProductPages,
+      scrapeDetails: config.scrapeDetails,
+      blockImages: config.blockImages,
+      headless: config.headless,
+      userDataDir: config.userDataDir,
+    },
   });
 });
 
 app.get('/getCategory', openTargetUrl);
 app.get('/getProduct', getProduct);
+app.get('/clear-cache', (request, response) => {
+  detailCache.clear();
+  response.json({ success: true, message: 'Product detail cache cleared.' });
+});
 
 const server = app
   .listen(PORT, () => {
     console.log(`Node server running at http://localhost:${PORT}`);
     console.log(`Open http://localhost:${PORT}/getCategory to launch ${TARGET_URL} in Chrome.`);
+    console.log(`Persistent profile: ${config.userDataDir}`);
   })
   .on('error', (error) => {
     if (error.code === 'EADDRINUSE') {
       console.error(`Port ${PORT} is already in use.`);
-      console.error('Stop the existing server or run with a different port, for example: PORT=3001 node serverms.js');
+      console.error('Stop the existing server or run with a different port, for example: PORT=3002 node serverms_optimized.js');
       process.exit(1);
     }
 
     throw error;
   });
 
-process.on('SIGINT', () => {
-  server.close(() => process.exit(0));
-});
+async function shutdown() {
+  server.close(async () => {
+    await pagePool?.close().catch(() => {});
+    process.exit(0);
+  });
+}
+
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown);
