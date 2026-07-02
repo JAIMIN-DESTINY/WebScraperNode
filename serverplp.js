@@ -4,8 +4,13 @@ const { chromium } = require('playwright');
 const PORT = readPositiveInt('PORT', 3002);
 const TARGET_URL = 'https://www.phonelcdparts.com/';
 const PRODUCT_ITEM_SELECTORS = [
+  'form.product_addtocart_form.product-item',
+  'form.product-item',
+  'form[data-sku][action*="/checkout/cart/add/"]',
   'li.product-item',
   'li.item.product.product-item',
+  '.products-grid form.product-item',
+  '.products-list form.product-item',
   '.products-grid .product-item',
   '.product-items > li',
 ];
@@ -45,6 +50,12 @@ const NEXT_PAGE_SELECTORS = [
   '.pages-item-next a',
   'li.pages-item-next a',
   'a.next',
+];
+const EMPTY_PRODUCT_SELECTORS = [
+  '.message.info.empty',
+  '.message.notice',
+  '.catalog-empty',
+  '.products-empty',
 ];
 const DESKTOP_USER_AGENT =
   process.env.CHROME_USER_AGENT ||
@@ -190,13 +201,64 @@ async function acceptCookies(page) {
 }
 
 async function waitForProductItems(page) {
-  const selector = PRODUCT_ITEM_SELECTORS.join(', ');
+  const selectors = {
+    item: PRODUCT_ITEM_SELECTORS.join(', '),
+    empty: EMPTY_PRODUCT_SELECTORS.join(', '),
+  };
+  const waitTimeout = Math.min(config.requestTimeout, 15000);
 
-  await page.waitForFunction(
-    (itemSelector) => document.querySelectorAll(itemSelector).length > 0,
-    selector,
-    { timeout: config.requestTimeout }
-  );
+  const state = await page
+    .waitForFunction(
+      ({ item, empty }) => {
+        const productCount = document.querySelectorAll(item).length;
+
+        if (productCount > 0) {
+          return { ready: true, productCount };
+        }
+
+        const emptyMessage = Array.from(document.querySelectorAll(empty))
+          .map((element) => (element.textContent || '').replace(/\s+/g, ' ').trim())
+          .find(Boolean);
+
+        if (emptyMessage) {
+          return { ready: true, productCount: 0, emptyMessage };
+        }
+
+        return false;
+      },
+      selectors,
+      { timeout: waitTimeout }
+    )
+    .then((handle) => handle.jsonValue())
+    .catch(() => null);
+
+  if (state?.productCount > 0 || state?.emptyMessage) {
+    return;
+  }
+
+  const diagnostics = await getListingDiagnostics(page, selectors.item);
+  console.error(`PhoneLCDParts product listing did not become ready: ${JSON.stringify(diagnostics)}`);
+}
+
+async function getListingDiagnostics(page, itemSelector) {
+  return page
+    .evaluate((selector) => {
+      const normalize = (value) => (value || '').replace(/\s+/g, ' ').trim();
+      const title = normalize(document.querySelector('h1')?.textContent || document.title);
+      const productLinkCount = document.querySelectorAll('a.product-item-link, a.product-item-photo').length;
+      const cartFormCount = document.querySelectorAll('form[action*="/checkout/cart/add/"], form[data-sku]').length;
+      const bodyText = normalize(document.body?.textContent || '').slice(0, 300);
+
+      return {
+        url: window.location.href,
+        title,
+        itemCount: document.querySelectorAll(selector).length,
+        productLinkCount,
+        cartFormCount,
+        bodyText,
+      };
+    }, itemSelector)
+    .catch((error) => ({ error: error.message }));
 }
 
 async function autoScrollUntilStable(page) {
@@ -344,6 +406,17 @@ async function extractProductsFromCurrentPage(page) {
       const priceMatch = normalize(item.textContent).match(/Login To See Price|\$[\d,.]+/i);
       return priceMatch ? priceMatch[0] : '';
     };
+    const findProductSku = (item) => {
+      const candidates = [
+        item.getAttribute('data-sku'),
+        item.querySelector('[data-sku]')?.getAttribute('data-sku'),
+        item.querySelector('[name="sku"]')?.getAttribute('value'),
+        item.querySelector('.sku .value')?.textContent,
+        item.querySelector('.product-item-details .block strong')?.textContent,
+      ];
+
+      return normalize(candidates.find((candidate) => normalize(candidate)) || '').replace(/^SKU\s*[:#-]?\s*/i, '');
+    };
 
     return Array.from(document.querySelectorAll(selectorSet.item))
       .map((item) => {
@@ -363,6 +436,7 @@ async function extractProductsFromCurrentPage(page) {
           name,
           product_url: productUrl,
           price,
+          sku: findProductSku(item),
         };
       })
       .filter(Boolean);
