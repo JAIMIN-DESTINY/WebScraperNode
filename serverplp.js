@@ -1,0 +1,525 @@
+const express = require('express');
+const { chromium } = require('playwright');
+
+const PORT = readPositiveInt('PORT', 3002);
+const TARGET_URL = 'https://www.phonelcdparts.com/';
+const PRODUCT_ITEM_SELECTORS = [
+  'li.product-item',
+  'li.item.product.product-item',
+  '.products-grid .product-item',
+  '.product-items > li',
+];
+const PRODUCT_LINK_SELECTORS = [
+  'a.product-item-link',
+  'strong.product-item-name a',
+  '.product.name a',
+  'a.product-item-photo',
+  'a.product.photo.product-item-photo',
+  'a[href*=".html"]',
+];
+const PRODUCT_NAME_SELECTORS = [
+  'a.product-item-link',
+  'strong.product-item-name',
+  '.product-item-name',
+  '.product.name',
+];
+const PRODUCT_PRICE_SELECTORS = [
+  '[data-price-type="finalPrice"] .price',
+  '.special-price .price',
+  '.price-final_price .price',
+  '.price-box .price',
+  '.price',
+];
+const PRODUCT_IMAGE_SELECTORS = [
+  'a.product-item-photo img.product-image-photo',
+  'a.product.photo.product-item-photo img',
+  '.product.photo.product-item-photo img',
+  '.product-image-container img',
+  'img.product-image-photo',
+  '.product-image-wrapper img',
+  'img.lazyload',
+  'img.lazy',
+];
+const NEXT_PAGE_SELECTORS = [
+  'a.action.next',
+  '.pages-item-next a',
+  'li.pages-item-next a',
+  'a.next',
+];
+const DESKTOP_USER_AGENT =
+  process.env.CHROME_USER_AGENT ||
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36';
+
+const config = {
+  requestTimeout: readPositiveInt('REQUEST_TIMEOUT', 60000),
+  headless: readBoolean('HEADLESS', true),
+  maxPages: Math.max(0, readInteger('MAX_PRODUCT_PAGES', 0)),
+  maxScrollRounds: readPositiveInt('MAX_SCROLL_ROUNDS', 40),
+  scrollDelayMs: readPositiveInt('SCROLL_DELAY_MS', 700),
+  stableScrollRounds: readPositiveInt('STABLE_SCROLL_ROUNDS', 3),
+  locale: process.env.PLAYWRIGHT_LOCALE || 'en-US',
+  timezoneId: process.env.PLAYWRIGHT_TIMEZONE || 'America/New_York',
+};
+
+const app = express();
+
+function readInteger(name, defaultValue) {
+  const value = Number.parseInt(process.env[name] || `${defaultValue}`, 10);
+  return Number.isFinite(value) ? value : defaultValue;
+}
+
+function readPositiveInt(name, defaultValue) {
+  return Math.max(1, readInteger(name, defaultValue));
+}
+
+function readBoolean(name, defaultValue) {
+  if (!(name in process.env)) {
+    return defaultValue;
+  }
+
+  return ['1', 'true', 'yes', 'on'].includes(`${process.env[name]}`.toLowerCase());
+}
+
+function normalizeText(value) {
+  return (value || '').replace(/\s+/g, ' ').trim();
+}
+
+function isoSeconds(date) {
+  return date.toISOString().slice(0, 19);
+}
+
+function isAllowedUrl(value) {
+  try {
+    const parsedUrl = new URL(value);
+    return ['http:', 'https:'].includes(parsedUrl.protocol);
+  } catch (error) {
+    return false;
+  }
+}
+
+function createLaunchOptions() {
+  const launchOptions = {
+    headless: config.headless,
+    args: [
+      '--no-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-blink-features=AutomationControlled',
+      '--no-first-run',
+      '--no-default-browser-check',
+      '--window-size=1920,1080',
+    ],
+  };
+
+  if (process.env.CHROME_PATH) {
+    launchOptions.executablePath = process.env.CHROME_PATH;
+  }
+
+  return launchOptions;
+}
+
+async function createContext(browser) {
+  const context = await browser.newContext({
+    userAgent: DESKTOP_USER_AGENT,
+    viewport: { width: 1920, height: 1080 },
+    screen: { width: 1920, height: 1080 },
+    deviceScaleFactor: 1,
+    isMobile: false,
+    hasTouch: false,
+    locale: config.locale,
+    timezoneId: config.timezoneId,
+    javaScriptEnabled: true,
+    extraHTTPHeaders: {
+      'Accept-Language': `${config.locale},en;q=0.9`,
+      'Cache-Control': 'no-cache',
+    },
+  });
+
+  context.setDefaultTimeout(config.requestTimeout);
+  context.setDefaultNavigationTimeout(config.requestTimeout);
+
+  await context.addInitScript(() => {
+    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+    Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
+    Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+  });
+
+  await context.route('**/*', async (route) => {
+    const resourceType = route.request().resourceType();
+
+    if (['font', 'media'].includes(resourceType)) {
+      return route.abort();
+    }
+
+    return route.continue();
+  });
+
+  return context;
+}
+
+async function gotoPage(page, url) {
+  await page.goto(url, {
+    waitUntil: 'domcontentloaded',
+    timeout: config.requestTimeout,
+  });
+
+  await page.waitForSelector('body', { state: 'attached', timeout: config.requestTimeout });
+  await acceptCookies(page);
+  await waitForProductItems(page);
+}
+
+async function acceptCookies(page) {
+  const cookieButtons = [
+    '#btn-cookie-allow',
+    'button:has-text("Allow Cookies")',
+    'button:has-text("Accept")',
+    '.action.allow.primary',
+  ];
+
+  for (const selector of cookieButtons) {
+    const button = page.locator(selector).first();
+
+    if ((await button.count()) === 0) {
+      continue;
+    }
+
+    await button.click({ timeout: 2000 }).catch(() => {});
+    await page.waitForTimeout(250);
+    break;
+  }
+}
+
+async function waitForProductItems(page) {
+  const selector = PRODUCT_ITEM_SELECTORS.join(', ');
+
+  await page.waitForFunction(
+    (itemSelector) => document.querySelectorAll(itemSelector).length > 0,
+    selector,
+    { timeout: config.requestTimeout }
+  );
+}
+
+async function autoScrollUntilStable(page) {
+  const itemSelector = PRODUCT_ITEM_SELECTORS.join(', ');
+  let previousCount = 0;
+  let previousHeight = 0;
+  let stableRounds = 0;
+
+  for (let round = 0; round < config.maxScrollRounds; round++) {
+    const { count, height } = await page.evaluate((selector) => {
+      window.scrollBy(0, Math.max(window.innerHeight * 0.85, 700));
+
+      document.querySelectorAll('img').forEach((image) => {
+        if (image.dataset?.src && !image.getAttribute('src')) {
+          image.setAttribute('src', image.dataset.src);
+        }
+
+        if (image.dataset?.original && !image.getAttribute('src')) {
+          image.setAttribute('src', image.dataset.original);
+        }
+
+        if (image.dataset?.lazy && !image.getAttribute('src')) {
+          image.setAttribute('src', image.dataset.lazy);
+        }
+      });
+
+      return {
+        count: document.querySelectorAll(selector).length,
+        height: document.body.scrollHeight,
+      };
+    }, itemSelector);
+
+    await page.waitForLoadState('networkidle', { timeout: config.scrollDelayMs }).catch(() => {});
+    await page.waitForTimeout(config.scrollDelayMs);
+
+    if (count === previousCount && height === previousHeight) {
+      stableRounds++;
+
+      if (stableRounds >= config.stableScrollRounds) {
+        break;
+      }
+    } else {
+      stableRounds = 0;
+      previousCount = count;
+      previousHeight = height;
+    }
+  }
+
+  await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+  await page.waitForLoadState('networkidle', { timeout: 2000 }).catch(() => {});
+}
+
+async function extractProductsFromCurrentPage(page) {
+  const selectors = {
+    item: PRODUCT_ITEM_SELECTORS.join(', '),
+    link: PRODUCT_LINK_SELECTORS.join(', '),
+    name: PRODUCT_NAME_SELECTORS.join(', '),
+    price: PRODUCT_PRICE_SELECTORS.join(', '),
+    image: PRODUCT_IMAGE_SELECTORS.join(', '),
+  };
+
+  return page.evaluate((selectorSet) => {
+    const normalize = (value) => (value || '').replace(/\s+/g, ' ').trim();
+    const firstImageFromValue = (value) => {
+      if (!value) {
+        return '';
+      }
+
+      return value.split(',')[0].trim().split(' ')[0].trim();
+    };
+    const absoluteUrl = (value) => {
+      if (!value) {
+        return '';
+      }
+
+      try {
+        return new URL(value, window.location.origin).toString();
+      } catch (error) {
+        return '';
+      }
+    };
+    const imageFromElement = (image) => {
+      if (!image) {
+        return '';
+      }
+
+      const attributes = [
+        'src',
+        'data-src',
+        'data-original',
+        'data-lazy',
+        'data-amsrc',
+        'data-srcset',
+        'srcset',
+      ];
+
+      for (const attribute of attributes) {
+        const imageUrl = firstImageFromValue(image.getAttribute(attribute));
+
+        if (imageUrl && !imageUrl.startsWith('data:') && !imageUrl.includes('/colortag/')) {
+          return absoluteUrl(imageUrl);
+        }
+      }
+
+      return '';
+    };
+    const findProductImage = (item) => {
+      const preferredImage = item.querySelector(selectorSet.image);
+      const preferredImageUrl = imageFromElement(preferredImage);
+
+      if (preferredImageUrl) {
+        return preferredImageUrl;
+      }
+
+      for (const image of Array.from(item.querySelectorAll('img'))) {
+        const imageUrl = imageFromElement(image);
+
+        if (imageUrl && !imageUrl.includes('/colortag/')) {
+          return imageUrl;
+        }
+      }
+
+      return '';
+    };
+    const findProductName = (item, link, image) => {
+      const nameElement = item.querySelector(selectorSet.name);
+      const candidates = [
+        nameElement?.textContent,
+        link?.textContent,
+        link?.getAttribute('title'),
+        image?.getAttribute('alt'),
+        image?.getAttribute('title'),
+      ];
+
+      return normalize(candidates.find((candidate) => normalize(candidate)) || '');
+    };
+    const findProductPrice = (item) => {
+      const priceElement = item.querySelector(selectorSet.price);
+      const price = normalize(priceElement?.textContent || '');
+
+      if (price) {
+        return price;
+      }
+
+      const priceMatch = normalize(item.textContent).match(/Login To See Price|\$[\d,.]+/i);
+      return priceMatch ? priceMatch[0] : '';
+    };
+
+    return Array.from(document.querySelectorAll(selectorSet.item))
+      .map((item) => {
+        const link = item.querySelector(selectorSet.link);
+        const imageElement = item.querySelector(selectorSet.image);
+        const name = findProductName(item, link, imageElement);
+        const productUrl = absoluteUrl(link?.getAttribute('href') || '');
+        const price = findProductPrice(item);
+        const image = findProductImage(item);
+
+        if (!name && !productUrl && !price && !image) {
+          return null;
+        }
+
+        return {
+          image,
+          name,
+          product_url: productUrl,
+          price,
+        };
+      })
+      .filter(Boolean);
+  }, selectors);
+}
+
+async function getNextPageUrl(page, seenPageUrls) {
+  const selectors = NEXT_PAGE_SELECTORS.join(', ');
+  const nextPageUrl = await page.evaluate((selector) => {
+    const link = Array.from(document.querySelectorAll(selector))
+      .find((element) => {
+        const ariaDisabled = element.getAttribute('aria-disabled');
+        const disabled = element.classList.contains('disabled');
+        const parentDisabled = element.closest('li')?.classList.contains('disabled');
+        return !disabled && !parentDisabled && ariaDisabled !== 'true' && element.getAttribute('href');
+      });
+
+    if (!link) {
+      return '';
+    }
+
+    try {
+      return new URL(link.getAttribute('href'), window.location.href).toString();
+    } catch (error) {
+      return '';
+    }
+  }, selectors);
+
+  if (!nextPageUrl || seenPageUrls.has(nextPageUrl)) {
+    return '';
+  }
+
+  return nextPageUrl;
+}
+
+async function scrapeProducts(url) {
+  const browser = await chromium.launch(createLaunchOptions());
+  const context = await createContext(browser);
+  const page = await context.newPage();
+  const products = [];
+  const seenProducts = new Set();
+  const seenPageUrls = new Set();
+  let currentUrl = url;
+  let pageNumber = 0;
+
+  page.setDefaultTimeout(config.requestTimeout);
+  page.setDefaultNavigationTimeout(config.requestTimeout);
+
+  try {
+    while (currentUrl) {
+      pageNumber++;
+
+      if (config.maxPages > 0 && pageNumber > config.maxPages) {
+        break;
+      }
+
+      seenPageUrls.add(currentUrl);
+      await gotoPage(page, currentUrl);
+      await autoScrollUntilStable(page);
+
+      for (const product of await extractProductsFromCurrentPage(page)) {
+        const key = product.product_url || [product.name, product.price, product.image].join('|');
+
+        if (seenProducts.has(key)) {
+          continue;
+        }
+
+        seenProducts.add(key);
+        products.push(product);
+      }
+
+      currentUrl = await getNextPageUrl(page, seenPageUrls);
+    }
+
+    return products;
+  } finally {
+    await context.close().catch((error) => {
+      console.error(`Playwright context close failed: ${error.message}`);
+    });
+    await browser.close().catch((error) => {
+      console.error(`Playwright browser close failed: ${error.message}`);
+    });
+  }
+}
+
+async function getProduct(request, response) {
+  const { url } = request.query;
+  const processStartedAt = new Date();
+  const processStartedMs = Date.now();
+
+  console.log(`Open http://localhost:${PORT}/getProduct?url=${url || ''}`);
+
+  if (!url) {
+    return response.status(400).json({
+      success: false,
+      message: 'URL parameter is required.',
+    });
+  }
+
+  if (!isAllowedUrl(url)) {
+    return response.status(400).json({
+      success: false,
+      message: 'URL parameter must be a valid http/https URL.',
+    });
+  }
+
+  try {
+    const products = await scrapeProducts(url);
+    const processFinishedAt = new Date();
+
+    return response.json({
+      success: true,
+      url,
+      count: products.length,
+      process_start_date: isoSeconds(processStartedAt),
+      process_end_date: isoSeconds(processFinishedAt),
+      sync_minutes: Number(((Date.now() - processStartedMs) / 60000).toFixed(2)),
+      data: products,
+    });
+  } catch (error) {
+    const processFinishedAt = new Date();
+
+    return response.status(500).json({
+      success: false,
+      url,
+      error: error.message,
+      process_start_date: isoSeconds(processStartedAt),
+      process_end_date: isoSeconds(processFinishedAt),
+      sync_minutes: Number(((Date.now() - processStartedMs) / 60000).toFixed(2)),
+    });
+  }
+}
+
+app.get('/', (request, response) => {
+  response.json({
+    status: 'running',
+    getProduct: `http://localhost:${PORT}/getProduct?url=${encodeURIComponent(TARGET_URL)}`,
+  });
+});
+
+app.get('/getProduct', getProduct);
+
+const server = app
+  .listen(PORT, () => {
+    console.log(`PhoneLCDParts scraper running at http://localhost:${PORT}`);
+    console.log(`Open http://localhost:${PORT}/getProduct?url=${TARGET_URL}`);
+  })
+  .on('error', (error) => {
+    if (error.code === 'EADDRINUSE') {
+      console.error(`Port ${PORT} is already in use.`);
+      console.error('Stop the existing server or run with another port, for example: PORT=3007 node serverplp.js');
+      process.exit(1);
+    }
+
+    throw error;
+  });
+
+process.on('SIGINT', () => {
+  server.close(() => process.exit(0));
+});
