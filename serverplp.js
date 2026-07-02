@@ -59,6 +59,13 @@ const EMPTY_PRODUCT_SELECTORS = [
   '.catalog-empty',
   '.products-empty',
 ];
+const BLOCKED_PAGE_PATTERNS = [
+  'sorry, you have been blocked',
+  'you are unable to access',
+  'this website is using a security service',
+  'please enable cookies',
+  'access denied',
+];
 const DESKTOP_USER_AGENT =
   process.env.CHROME_USER_AGENT ||
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36';
@@ -72,9 +79,21 @@ const config = {
   stableScrollRounds: readPositiveInt('STABLE_SCROLL_ROUNDS', 3),
   locale: process.env.PLAYWRIGHT_LOCALE || 'en-US',
   timezoneId: process.env.PLAYWRIGHT_TIMEZONE || 'America/New_York',
+  blockUnneededResources: readBoolean('BLOCK_UNNEEDED_RESOURCES', false),
+  proxyServer: process.env.PLAYWRIGHT_PROXY_SERVER || process.env.PROXY_SERVER || '',
+  proxyUsername: process.env.PLAYWRIGHT_PROXY_USERNAME || process.env.PROXY_USERNAME || '',
+  proxyPassword: process.env.PLAYWRIGHT_PROXY_PASSWORD || process.env.PROXY_PASSWORD || '',
 };
 
 const app = express();
+
+class AccessBlockedError extends Error {
+  constructor(message, diagnostics = {}) {
+    super(message);
+    this.name = 'AccessBlockedError';
+    this.diagnostics = diagnostics;
+  }
+}
 
 function readInteger(name, defaultValue) {
   const value = Number.parseInt(process.env[name] || `${defaultValue}`, 10);
@@ -127,6 +146,14 @@ function createLaunchOptions() {
     launchOptions.executablePath = process.env.CHROME_PATH;
   }
 
+  if (config.proxyServer) {
+    launchOptions.proxy = {
+      server: config.proxyServer,
+      username: config.proxyUsername || undefined,
+      password: config.proxyPassword || undefined,
+    };
+  }
+
   return launchOptions;
 }
 
@@ -157,15 +184,17 @@ async function createContext(browser) {
     Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
   });
 
-  await context.route('**/*', async (route) => {
-    const resourceType = route.request().resourceType();
+  if (config.blockUnneededResources) {
+    await context.route('**/*', async (route) => {
+      const resourceType = route.request().resourceType();
 
-    if (['font', 'media'].includes(resourceType)) {
-      return route.abort();
-    }
+      if (['font', 'media'].includes(resourceType)) {
+        return route.abort();
+      }
 
-    return route.continue();
-  });
+      return route.continue();
+    });
+  }
 
   return context;
 }
@@ -178,6 +207,7 @@ async function gotoPage(page, url) {
 
   await page.waitForSelector('body', { state: 'attached', timeout: config.requestTimeout });
   await acceptCookies(page);
+  await assertAccessAllowed(page);
   await waitForProductItems(page);
 }
 
@@ -236,22 +266,24 @@ async function waitForProductItems(page) {
     .then((handle) => handle.jsonValue())
     .catch(() => null);
 
-  if (state?.productCount > 0 || state?.emptyMessage) {
+  if (state?.ready || state?.emptyMessage) {
     return;
   }
 
   const diagnostics = await getListingDiagnostics(page, selectors.item);
+  throwIfBlocked(diagnostics);
   console.error(`PhoneLCDParts product listing did not become ready: ${JSON.stringify(diagnostics)}`);
 }
 
 async function getListingDiagnostics(page, itemSelector) {
   return page
-    .evaluate((selector) => {
+    .evaluate(({ selector, blockedPatterns }) => {
       const normalize = (value) => (value || '').replace(/\s+/g, ' ').trim();
       const title = normalize(document.querySelector('h1')?.textContent || document.title);
       const productLinkCount = document.querySelectorAll('a.product-item-link, a.product-item-photo').length;
       const cartFormCount = document.querySelectorAll('form[action*="/checkout/cart/add/"], form[data-sku]').length;
       const bodyText = normalize(document.body?.textContent || '').slice(0, 300);
+      const pageText = `${title} ${bodyText}`.toLowerCase();
 
       return {
         url: window.location.href,
@@ -259,10 +291,27 @@ async function getListingDiagnostics(page, itemSelector) {
         itemCount: document.querySelectorAll(selector).length,
         productLinkCount,
         cartFormCount,
+        blocked: blockedPatterns.some((pattern) => pageText.includes(pattern)),
         bodyText,
       };
-    }, itemSelector)
+    }, { selector: itemSelector, blockedPatterns: BLOCKED_PAGE_PATTERNS })
     .catch((error) => ({ error: error.message }));
+}
+
+async function assertAccessAllowed(page) {
+  const diagnostics = await getListingDiagnostics(page, PRODUCT_ITEM_SELECTORS.join(', '));
+  throwIfBlocked(diagnostics);
+}
+
+function throwIfBlocked(diagnostics) {
+  if (!diagnostics?.blocked) {
+    return;
+  }
+
+  throw new AccessBlockedError(
+    'PhoneLCDParts blocked this scraper host. Configure PLAYWRIGHT_PROXY_SERVER/PROXY_SERVER with an allowed browser-capable proxy or allowlist the live server IP.',
+    diagnostics
+  );
 }
 
 async function autoScrollUntilStable(page) {
@@ -613,11 +662,14 @@ async function getProduct(request, response) {
     });
   } catch (error) {
     const processFinishedAt = new Date();
+    const isBlocked = error instanceof AccessBlockedError;
 
-    return response.status(500).json({
+    return response.status(isBlocked ? 403 : 500).json({
       success: false,
       url,
+      blocked: isBlocked,
       error: error.message,
+      diagnostics: isBlocked ? error.diagnostics : undefined,
       process_start_date: isoSeconds(processStartedAt),
       process_end_date: isoSeconds(processFinishedAt),
       sync_minutes: Number(((Date.now() - processStartedMs) / 60000).toFixed(2)),
