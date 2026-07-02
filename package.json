@@ -13,6 +13,7 @@
     "bullmq": "^5.79.2",
     "express": "^4.19.2",
     "ioredis": "^5.11.1",
-    "playwright": "^1.61.1"
+    "playwright": "^1.61.1",
+    "selenium-webdriver": "^4.45.0"
   }
 }
