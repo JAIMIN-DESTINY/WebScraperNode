@@ -66,20 +66,18 @@ const BLOCKED_PAGE_PATTERNS = [
   'please enable cookies',
   'access denied',
 ];
-const DESKTOP_USER_AGENT =
-  process.env.CHROME_USER_AGENT ||
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36';
-
 const config = {
   requestTimeout: readPositiveInt('REQUEST_TIMEOUT', 60000),
   headless: readBoolean('HEADLESS', true),
+  browserChannel: process.env.PLAYWRIGHT_BROWSER_CHANNEL || process.env.BROWSER_CHANNEL || 'chrome',
+  userDataDir: process.env.CHROME_USER_DATA_DIR || '',
   maxPages: Math.max(0, readInteger('MAX_PRODUCT_PAGES', 0)),
   maxScrollRounds: readPositiveInt('MAX_SCROLL_ROUNDS', 40),
   scrollDelayMs: readPositiveInt('SCROLL_DELAY_MS', 700),
   stableScrollRounds: readPositiveInt('STABLE_SCROLL_ROUNDS', 3),
   locale: process.env.PLAYWRIGHT_LOCALE || 'en-US',
   timezoneId: process.env.PLAYWRIGHT_TIMEZONE || 'America/New_York',
-  blockUnneededResources: readBoolean('BLOCK_UNNEEDED_RESOURCES', false),
+  userAgent: process.env.CHROME_USER_AGENT || '',
   proxyServer: process.env.PLAYWRIGHT_PROXY_SERVER || process.env.PROXY_SERVER || '',
   proxyUsername: process.env.PLAYWRIGHT_PROXY_USERNAME || process.env.PROXY_USERNAME || '',
   proxyPassword: process.env.PLAYWRIGHT_PROXY_PASSWORD || process.env.PROXY_PASSWORD || '',
@@ -129,7 +127,7 @@ function isAllowedUrl(value) {
   }
 }
 
-function createLaunchOptions() {
+function createLaunchOptions(includeChannel = true) {
   const launchOptions = {
     headless: config.headless,
     args: [
@@ -142,24 +140,38 @@ function createLaunchOptions() {
     ],
   };
 
-  if (process.env.CHROME_PATH) {
-    launchOptions.executablePath = process.env.CHROME_PATH;
+  if (includeChannel && config.browserChannel) {
+    launchOptions.channel = config.browserChannel;
   }
 
-  if (config.proxyServer) {
-    launchOptions.proxy = {
-      server: config.proxyServer,
-      username: config.proxyUsername || undefined,
-      password: config.proxyPassword || undefined,
-    };
+  if (process.env.CHROME_PATH) {
+    launchOptions.executablePath = process.env.CHROME_PATH;
+    delete launchOptions.channel;
+  }
+
+  const proxy = createProxyOptions();
+
+  if (proxy) {
+    launchOptions.proxy = proxy;
   }
 
   return launchOptions;
 }
 
-async function createContext(browser) {
-  const context = await browser.newContext({
-    userAgent: DESKTOP_USER_AGENT,
+function createProxyOptions() {
+  if (!config.proxyServer) {
+    return undefined;
+  }
+
+  return {
+    server: config.proxyServer,
+    username: config.proxyUsername || undefined,
+    password: config.proxyPassword || undefined,
+  };
+}
+
+function createContextOptions() {
+  const contextOptions = {
     viewport: { width: 1920, height: 1080 },
     screen: { width: 1920, height: 1080 },
     deviceScaleFactor: 1,
@@ -172,11 +184,18 @@ async function createContext(browser) {
       'Accept-Language': `${config.locale},en;q=0.9`,
       'Cache-Control': 'no-cache',
     },
-  });
+  };
 
+  if (config.userAgent) {
+    contextOptions.userAgent = config.userAgent;
+  }
+
+  return contextOptions;
+}
+
+async function prepareContext(context) {
   context.setDefaultTimeout(config.requestTimeout);
   context.setDefaultNavigationTimeout(config.requestTimeout);
-
   await context.addInitScript(() => {
     Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
     Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
@@ -184,19 +203,60 @@ async function createContext(browser) {
     Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
   });
 
-  if (config.blockUnneededResources) {
-    await context.route('**/*', async (route) => {
-      const resourceType = route.request().resourceType();
+  return context;
+}
 
-      if (['font', 'media'].includes(resourceType)) {
-        return route.abort();
-      }
-
-      return route.continue();
-    });
+async function createBrowserSession() {
+  if (config.userDataDir) {
+    const context = await launchPersistentContext();
+    return {
+      context,
+      close: () => context.close(),
+    };
   }
 
-  return context;
+  const browser = await launchBrowser();
+  const context = await prepareContext(await browser.newContext(createContextOptions()));
+
+  return {
+    context,
+    close: async () => {
+      await context.close();
+      await browser.close();
+    },
+  };
+}
+
+async function launchBrowser() {
+  try {
+    return await chromium.launch(createLaunchOptions(true));
+  } catch (error) {
+    if (!config.browserChannel || process.env.CHROME_PATH) {
+      throw error;
+    }
+
+    console.error(`Chrome channel "${config.browserChannel}" unavailable, falling back to bundled Chromium: ${error.message}`);
+    return chromium.launch(createLaunchOptions(false));
+  }
+}
+
+async function launchPersistentContext() {
+  try {
+    return await prepareContext(await chromium.launchPersistentContext(config.userDataDir, {
+      ...createLaunchOptions(true),
+      ...createContextOptions(),
+    }));
+  } catch (error) {
+    if (!config.browserChannel || process.env.CHROME_PATH) {
+      throw error;
+    }
+
+    console.error(`Chrome channel "${config.browserChannel}" unavailable, falling back to bundled Chromium: ${error.message}`);
+    return prepareContext(await chromium.launchPersistentContext(config.userDataDir, {
+      ...createLaunchOptions(false),
+      ...createContextOptions(),
+    }));
+  }
 }
 
 async function gotoPage(page, url) {
@@ -577,9 +637,8 @@ async function getNextPageUrl(page, seenPageUrls) {
 }
 
 async function scrapeProducts(url) {
-  const browser = await chromium.launch(createLaunchOptions());
-  const context = await createContext(browser);
-  const page = await context.newPage();
+  const session = await createBrowserSession();
+  const page = await session.context.newPage();
   const products = [];
   const seenProducts = new Set();
   const seenPageUrls = new Set();
@@ -617,11 +676,8 @@ async function scrapeProducts(url) {
 
     return products;
   } finally {
-    await context.close().catch((error) => {
-      console.error(`Playwright context close failed: ${error.message}`);
-    });
-    await browser.close().catch((error) => {
-      console.error(`Playwright browser close failed: ${error.message}`);
+    await session.close().catch((error) => {
+      console.error(`Playwright close failed: ${error.message}`);
     });
   }
 }
