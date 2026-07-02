@@ -1,5 +1,7 @@
 const express = require('express');
+const crypto = require('crypto');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const { Builder, By } = require('selenium-webdriver');
 const chrome = require('selenium-webdriver/chrome');
@@ -29,7 +31,11 @@ const config = {
   chromePath: process.env.CHROME_PATH || '',
   chromeDriverPath: process.env.CHROMEDRIVER_PATH || '',
   chromeUserDataDir: process.env.CHROME_USER_DATA_DIR || '',
-  proxyServer: process.env.PROXY_SERVER || process.env.PLAYWRIGHT_PROXY_SERVER || '',
+  defaultProxyServer: process.env.PLP_PROXY_SERVER ||
+    process.env.PHONE_LCD_PROXY_SERVER ||
+    process.env.PROXY_SERVER ||
+    process.env.PLAYWRIGHT_PROXY_SERVER ||
+    '',
 };
 
 const app = express();
@@ -76,7 +82,112 @@ function isAllowedUrl(value) {
   }
 }
 
-function createChromeOptions() {
+function getProxyConfig(value) {
+  const proxyServer = normalizeText(Array.isArray(value) ? value[0] : `${value || ''}`);
+
+  if (!proxyServer) {
+    return null;
+  }
+
+  if (!proxyServer.includes('://')) {
+    return {
+      server: proxyServer,
+      chromeServer: proxyServer,
+      username: '',
+      password: '',
+      masked: proxyServer,
+    };
+  }
+
+  const parsed = new URL(proxyServer);
+  const protocol = parsed.protocol.replace(':', '').toLowerCase();
+
+  if (!['http', 'https', 'socks4', 'socks5'].includes(protocol)) {
+    throw new Error('Proxy must use http, https, socks4, or socks5 protocol.');
+  }
+
+  const host = parsed.hostname;
+  const port = parsed.port ? `:${parsed.port}` : '';
+  const username = decodeURIComponent(parsed.username || '');
+  const password = decodeURIComponent(parsed.password || '');
+  const chromeServer = `${protocol}://${host}${port}`;
+
+  return {
+    server: proxyServer,
+    chromeServer,
+    username,
+    password,
+    masked: username ? `${protocol}://${username}:***@${host}${port}` : chromeServer,
+  };
+}
+
+function createProxyAuthExtension(proxyConfig) {
+  if (!proxyConfig?.username || !proxyConfig?.password || !proxyConfig.chromeServer.includes('://')) {
+    return '';
+  }
+
+  const parsed = new URL(proxyConfig.chromeServer);
+  const scheme = parsed.protocol.replace(':', '');
+  const host = parsed.hostname;
+  const port = Number.parseInt(parsed.port || (scheme === 'https' ? '443' : '80'), 10);
+  const extensionId = crypto
+    .createHash('sha1')
+    .update(`${proxyConfig.chromeServer}|${proxyConfig.username}`)
+    .digest('hex')
+    .slice(0, 16);
+  const extensionDir = path.join(os.tmpdir(), `plp-proxy-auth-${extensionId}`);
+
+  fs.mkdirSync(extensionDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(extensionDir, 'manifest.json'),
+    JSON.stringify(
+      {
+        manifest_version: 3,
+        name: 'PhoneLCDParts Proxy Auth',
+        version: '1.0.0',
+        permissions: ['proxy', 'webRequest', 'webRequestAuthProvider', 'storage'],
+        host_permissions: ['<all_urls>'],
+        background: {
+          service_worker: 'background.js',
+        },
+      },
+      null,
+      2
+    )
+  );
+  fs.writeFileSync(
+    path.join(extensionDir, 'background.js'),
+    `
+const proxyConfig = {
+  mode: 'fixed_servers',
+  rules: {
+    singleProxy: {
+      scheme: ${JSON.stringify(scheme)},
+      host: ${JSON.stringify(host)},
+      port: ${JSON.stringify(port)}
+    },
+    bypassList: ['localhost', '127.0.0.1']
+  }
+};
+
+chrome.proxy.settings.set({ value: proxyConfig, scope: 'regular' });
+chrome.webRequest.onAuthRequired.addListener(
+  (details, callback) => callback({
+    authCredentials: {
+      username: ${JSON.stringify(proxyConfig.username)},
+      password: ${JSON.stringify(proxyConfig.password)}
+    }
+  }),
+  { urls: ['<all_urls>'] },
+  ['asyncBlocking']
+);
+`.trim()
+  );
+
+  return extensionDir;
+}
+
+function createChromeOptions(proxyConfig = null) {
   const options = new chrome.Options();
 
   options.addArguments(
@@ -98,17 +209,23 @@ function createChromeOptions() {
     options.addArguments(`--user-data-dir=${config.chromeUserDataDir}`);
   }
 
-  if (config.proxyServer) {
-    options.addArguments(`--proxy-server=${config.proxyServer}`);
+  if (proxyConfig?.chromeServer) {
+    options.addArguments(`--proxy-server=${proxyConfig.chromeServer}`);
+
+    const proxyAuthExtension = createProxyAuthExtension(proxyConfig);
+
+    if (proxyAuthExtension) {
+      options.addArguments(`--load-extension=${proxyAuthExtension}`);
+    }
   }
 
   return options;
 }
 
-async function createDriver() {
+async function createDriver(proxyConfig = null) {
   const builder = new Builder()
     .forBrowser('chrome')
-    .setChromeOptions(createChromeOptions());
+    .setChromeOptions(createChromeOptions(proxyConfig));
   const originalPath = process.env.PATH;
 
   if (config.chromeDriverPath) {
@@ -434,8 +551,8 @@ function throwIfBlocked(diagnostics) {
   );
 }
 
-async function scrapeProducts(url) {
-  const driver = await createDriver();
+async function scrapeProducts(url, proxyConfig = null) {
+  const driver = await createDriver(proxyConfig);
   const products = [];
   const seenProducts = new Set();
   const seenPageUrls = new Set();
@@ -480,8 +597,22 @@ async function handleScrape(request, response) {
   const { url } = request.query;
   const processStartedAt = new Date();
   const processStartedMs = Date.now();
+  let proxyConfig;
+
+  try {
+    proxyConfig = getProxyConfig(request.query.proxy || config.defaultProxyServer);
+  } catch (error) {
+    return response.status(400).json({
+      success: false,
+      url,
+      error: error.message,
+    });
+  }
 
   console.log(`Open http://localhost:${PORT}/getProduct?url=${url || ''}`);
+  if (proxyConfig) {
+    console.log(`Using PhoneLCDParts proxy: ${proxyConfig.masked}`);
+  }
 
   if (!url) {
     return response.status(400).json({
@@ -498,12 +629,14 @@ async function handleScrape(request, response) {
   }
 
   try {
-    const products = await scrapeProducts(url);
+    const products = await scrapeProducts(url, proxyConfig);
     const processFinishedAt = new Date();
 
     return response.json({
       success: true,
       url,
+      proxy_active: Boolean(proxyConfig),
+      proxy: proxyConfig?.masked,
       count: products.length,
       total: products.length,
       process_start_date: isoSeconds(processStartedAt),
@@ -519,6 +652,8 @@ async function handleScrape(request, response) {
       success: false,
       url,
       blocked: isBlocked,
+      proxy_active: Boolean(proxyConfig),
+      proxy: proxyConfig?.masked,
       error: error.message,
       diagnostics: isBlocked ? error.diagnostics : undefined,
       process_start_date: isoSeconds(processStartedAt),
@@ -529,10 +664,20 @@ async function handleScrape(request, response) {
 }
 
 app.get('/', (request, response) => {
+  let proxyConfig = null;
+
+  try {
+    proxyConfig = getProxyConfig(config.defaultProxyServer);
+  } catch (error) {
+    proxyConfig = null;
+  }
+
   response.json({
     status: 'running',
     getProduct: `http://localhost:${PORT}/getProduct?url=${encodeURIComponent(TARGET_URL)}`,
     scrape: `http://localhost:${PORT}/scrape?url=${encodeURIComponent(TARGET_URL)}`,
+    proxy_active: Boolean(proxyConfig),
+    proxy: proxyConfig?.masked,
   });
 });
 
