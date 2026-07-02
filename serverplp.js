@@ -5,7 +5,9 @@ const PORT = readPositiveInt('PORT', 3002);
 const TARGET_URL = 'https://www.phonelcdparts.com/';
 const PRODUCT_ITEM_SELECTORS = [
   'form.product_addtocart_form.product-item',
+  'form.product_addtocart_form',
   'form.product-item',
+  'form[action*="/checkout/cart/add/"]',
   'form[data-sku][action*="/checkout/cart/add/"]',
   'li.product-item',
   'li.item.product.product-item',
@@ -211,9 +213,11 @@ async function waitForProductItems(page) {
     .waitForFunction(
       ({ item, empty }) => {
         const productCount = document.querySelectorAll(item).length;
+        const productLinkCount = document.querySelectorAll('a.product-item-link[href], a.product-item-photo[href]').length;
+        const cartFormCount = document.querySelectorAll('form[action*="/checkout/cart/add/"], form[data-sku]').length;
 
-        if (productCount > 0) {
-          return { ready: true, productCount };
+        if (productCount > 0 || productLinkCount > 0 || cartFormCount > 0) {
+          return { ready: true, productCount, productLinkCount, cartFormCount };
         }
 
         const emptyMessage = Array.from(document.querySelectorAll(empty))
@@ -417,8 +421,55 @@ async function extractProductsFromCurrentPage(page) {
 
       return normalize(candidates.find((candidate) => normalize(candidate)) || '').replace(/^SKU\s*[:#-]?\s*/i, '');
     };
+    const isProductUrl = (url) => {
+      if (!url) {
+        return false;
+      }
 
-    return Array.from(document.querySelectorAll(selectorSet.item))
+      try {
+        const parsedUrl = new URL(url, window.location.origin);
+        return (
+          parsedUrl.hostname === window.location.hostname &&
+          !parsedUrl.pathname.includes('/checkout/') &&
+          !parsedUrl.pathname.includes('/customer/') &&
+          !parsedUrl.pathname.includes('/wishlist/') &&
+          !parsedUrl.pathname.includes('/catalogsearch/')
+        );
+      } catch (error) {
+        return false;
+      }
+    };
+    const findContainerForLink = (link) => {
+      const productContainer = link.closest(selectorSet.item);
+
+      if (productContainer) {
+        return productContainer;
+      }
+
+      return link.closest('form, li, article, .product-item, .product, .card, [data-product-id]') || link.parentElement;
+    };
+    const getCandidateItems = () => {
+      const items = Array.from(document.querySelectorAll(selectorSet.item));
+
+      if (items.length > 0) {
+        return items;
+      }
+
+      const seen = new Set();
+      return Array.from(document.querySelectorAll(selectorSet.link))
+        .filter((link) => isProductUrl(absoluteUrl(link.getAttribute('href') || '')))
+        .map(findContainerForLink)
+        .filter((item) => {
+          if (!item || seen.has(item)) {
+            return false;
+          }
+
+          seen.add(item);
+          return true;
+        });
+    };
+
+    return getCandidateItems()
       .map((item) => {
         const link = item.querySelector(selectorSet.link);
         const imageElement = item.querySelector(selectorSet.image);
@@ -426,6 +477,10 @@ async function extractProductsFromCurrentPage(page) {
         const productUrl = absoluteUrl(link?.getAttribute('href') || '');
         const price = findProductPrice(item);
         const image = findProductImage(item);
+
+        if (!isProductUrl(productUrl)) {
+          return null;
+        }
 
         if (!name && !productUrl && !price && !image) {
           return null;
