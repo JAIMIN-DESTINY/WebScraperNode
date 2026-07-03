@@ -4,7 +4,8 @@
   "description": "Node server for opening MobileSentrix in Chrome.",
   "main": "serverms.js",
   "scripts": {
-    "start": "node serverms.js"
+    "start": "node serverms.js",
+    "start:p4c": "node serverp4c.js"
   },
   "keywords": [],
   "author": "",
