@@ -19,6 +19,15 @@ const TARGET_URL = 'https://www.phonelcdparts.com/';
 const TEST_CATEGORY_URL = 'https://www.phonelcdparts.com/apple/iphone-parts/iphone-17-pro';
 const MAX_PAGES = readPositiveInt('MAX_PLP_PAGES', 100);
 const PRODUCT_CARD_SELECTOR = 'form.product-item, .item.product.product-item, li.item.product';
+const PRODUCT_LIST_READY_SELECTOR = [
+  PRODUCT_CARD_SELECTOR,
+  '.products-grid',
+  '.products.wrapper',
+  '.products.list.items.product-items',
+  '.message.info.empty',
+  '.message.notice',
+  '.page.messages',
+].join(', ');
 const USER_AGENT =
   process.env.CHROME_USER_AGENT ||
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36';
@@ -172,6 +181,41 @@ async function getPageStats(page) {
   });
 }
 
+async function getPageDiagnostics(page) {
+  return page.evaluate((cardSelector) => {
+    const normalize = value => (value || '').replace(/\s+/g, ' ').trim();
+    const title = normalize(document.title);
+    const h1 = normalize(document.querySelector('h1')?.textContent);
+    const emptyMessage = normalize(
+      document.querySelector('.message.info.empty, .message.notice, .page.messages')?.textContent
+    );
+    const bodyText = normalize(document.body?.innerText).slice(0, 500);
+
+    return {
+      finalUrl: window.location.href,
+      title,
+      h1,
+      emptyMessage,
+      productCardCount: document.querySelectorAll(cardSelector).length,
+      bodyText,
+    };
+  }, PRODUCT_CARD_SELECTOR);
+}
+
+async function waitForProductList(page) {
+  try {
+    await page.waitForSelector(PRODUCT_LIST_READY_SELECTOR, {
+      state: 'attached',
+      timeout: 30000,
+    });
+  } catch {
+    const diagnostics = await getPageDiagnostics(page).catch(() => null);
+    console.warn('[scrapeProducts] Product list did not become ready:', diagnostics);
+  }
+
+  await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
+}
+
 async function collectVisibleProducts(page) {
   return page.evaluate((cardSelector) => {
     const normalize = value => (value || '').replace(/\s+/g, ' ').trim();
@@ -256,7 +300,7 @@ async function scrapeProducts(categoryUrl) {
         timeout: 60000,
       });
 
-      await page.waitForSelector(PRODUCT_CARD_SELECTOR, { timeout: 30000 });
+      await waitForProductList(page);
       await page.waitForTimeout(1000);
 
       const stats = await getPageStats(page);
@@ -277,12 +321,21 @@ async function scrapeProducts(categoryUrl) {
       if (expectedTotal !== null && seen.size >= expectedTotal) {
         break;
       }
+
+      if (products.length === 0) {
+        const diagnostics = await getPageDiagnostics(page);
+        console.warn('[scrapeProducts] No products collected on page:', diagnostics);
+        break;
+      }
     }
+
+    const diagnostics = seen.size === 0 ? await getPageDiagnostics(page) : null;
 
     return {
       executablePath,
       expectedTotal,
       totalPages,
+      diagnostics,
       products: Array.from(seen.values()),
     };
   } finally {
@@ -330,7 +383,7 @@ app.get('/getProduct', async (request, response) => {
   }
 
   try {
-    const { executablePath, expectedTotal, totalPages, products } = await scrapeProducts(categoryUrl);
+    const { executablePath, expectedTotal, totalPages, diagnostics, products } = await scrapeProducts(categoryUrl);
 
     response.json({
       success: true,
@@ -338,6 +391,7 @@ app.get('/getProduct', async (request, response) => {
       browser: executablePath,
       expectedTotal,
       totalPages,
+      diagnostics,
       count: products.length,
       products,
     });
