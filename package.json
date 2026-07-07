@@ -5,7 +5,8 @@
   "main": "serverms.js",
   "scripts": {
     "start": "node serverms.js",
-    "start:p4c": "node serverp4c.js"
+    "start:p4c": "node serverp4c.js",
+    "start:plp": "node serverplp.js"
   },
   "keywords": [],
   "author": "",
@@ -15,6 +16,8 @@
     "express": "^4.19.2",
     "ioredis": "^5.11.1",
     "playwright": "^1.61.1",
+    "playwright-extra": "^4.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2",
     "selenium-webdriver": "^4.45.0"
   }
 }
