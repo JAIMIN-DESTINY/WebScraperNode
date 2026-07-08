@@ -6,7 +6,8 @@
   "scripts": {
     "start": "node serverms.js",
     "start:p4c": "node serverp4c.js",
-    "start:plp": "node serverplp.js"
+    "start:plp": "node serverplp.js",
+    "start:xcp": "node serverxcp.js"
   },
   "keywords": [],
   "author": "",
